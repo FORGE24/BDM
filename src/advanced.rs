@@ -625,7 +625,12 @@ pub struct WorldModelExecutor {
     
     // 自然选择与微突变 (Micro-Mutation & Selection)
     pub branch_fitness: HashMap<String, f64>,      // 专家分支 -> 适应度 (0.0 - 1.0)
-    pub token_allocation: HashMap<String, usize>,  // 专家分支 -> 分配的 Token 空间
+    pub token_allocation: HashMap<String, i32>,    // 专家分支 -> 分配的 Token 空间 (环境资源池)
+    
+    // 动态突变引擎状态
+    pub mutation_rate: f64,                        // 当前突变率 (例如 0.001 到 0.08)
+    pub recent_success_rate: f64,                  // 近期成功率 (用于调整突变率)
+    pub evaluation_history: VecDeque<bool>,        // 近期评估结果 (true=成功, false=失败)
 }
 
 #[pymethods]
@@ -638,13 +643,16 @@ impl WorldModelExecutor {
             world_state: HashMap::new(),
             branch_fitness: HashMap::new(),
             token_allocation: HashMap::new(),
+            mutation_rate: 0.02,
+            recent_success_rate: 0.5,
+            evaluation_history: VecDeque::new(),
         };
         
-        // 初始化每个分支的 Token 空间
-        executor.token_allocation.insert("math".to_string(), 256);
-        executor.token_allocation.insert("physics".to_string(), 256);
-        executor.token_allocation.insert("logic".to_string(), 256);
-        executor.token_allocation.insert("memory".to_string(), 256);
+        // 初始化每个分支的 Token 空间 (环境资源池)
+        executor.token_allocation.insert("math".to_string(), 1000);
+        executor.token_allocation.insert("physics".to_string(), 1000);
+        executor.token_allocation.insert("logic".to_string(), 1000);
+        executor.token_allocation.insert("memory".to_string(), 1000);
         
         // 初始化适应度
         executor.branch_fitness.insert("math".to_string(), 0.5);
@@ -655,54 +663,116 @@ impl WorldModelExecutor {
         executor
     }
     
+    /// 环境资源池机制：消耗 Token (能量)。如果 Token 耗尽，触发自然选择中的死亡机制
+    fn consume_energy(&mut self, expert_type: String, tokens_used: i32) -> bool {
+        if let Some(tokens) = self.token_allocation.get_mut(&expert_type) {
+            *tokens -= tokens_used;
+            if *tokens <= 0 {
+                // Token 耗尽，触发死亡并直接进入遗传重组
+                self.respawn_expert(&expert_type);
+                return false; // 能量耗尽死亡
+            }
+        }
+        true // 存活
+    }
+    
+    /// 遗传重组：80/20 继承机制 (80% 继承最优专家，20% 变异)
+    fn respawn_expert(&mut self, dead_expert: &str) {
+        // 找到当前表现最好的专家
+        let mut best_expert = "".to_string();
+        let mut max_fit = 0.0;
+        let mut best_weight = 0.5;
+        
+        for exp in &self.router.experts {
+            if let Some(&fit) = self.branch_fitness.get(&exp.expert_type) {
+                if fit > max_fit && exp.expert_type != dead_expert {
+                    max_fit = fit;
+                    best_expert = exp.expert_type.clone();
+                    best_weight = exp.weight;
+                }
+            }
+        }
+        
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        
+        // 重置 Token 空间和适应度
+        self.token_allocation.insert(dead_expert.to_string(), 500); // 初始复活能量较低
+        self.branch_fitness.insert(dead_expert.to_string(), 0.5);   // 初始适应度
+        
+        // 80/20 基因继承
+        for exp in &mut self.router.experts {
+            if exp.expert_type == dead_expert {
+                // 继承 80% 最佳基因 + 20% 随机突变
+                let mutation = rng.gen_range(-0.1..=0.1); // 更大的重组突变
+                exp.weight = (best_weight * 0.8 + exp.weight * 0.2 + mutation).clamp(0.0, 1.0);
+            }
+        }
+    }
+    
+    /// 动态突变引擎：根据成功率调整突变幅度
+    fn adjust_mutation_rate(&mut self, success: bool) {
+        self.evaluation_history.push_back(success);
+        if self.evaluation_history.len() > 10 {
+            self.evaluation_history.pop_front();
+        }
+        
+        let successes = self.evaluation_history.iter().filter(|&&x| x).count();
+        self.recent_success_rate = successes as f64 / self.evaluation_history.len() as f64;
+        
+        // 如果成功率高，降低突变率 (稳定利用)
+        // 如果成功率低，提高突变率 (积极探索)
+        if self.recent_success_rate > 0.8 {
+            self.mutation_rate = (self.mutation_rate * 0.9).max(0.005); // 最小突变率
+        } else if self.recent_success_rate < 0.3 {
+            self.mutation_rate = (self.mutation_rate * 1.1).min(0.1);   // 最大突变率
+        }
+    }
+    
     /// 评估分支适应度，如果分支表现不佳（未能缓解恐惧脉冲），则进行微小惩罚。
     /// 极低适应度的分支将被直接剪枝（Token 空间释放给其他分支）
     fn evaluate_and_select(&mut self, fear_resolved: bool, active_expert_type: String) -> Vec<String> {
         let mut pruned_branches = Vec::new();
         
+        // 更新动态突变引擎
+        self.adjust_mutation_rate(fear_resolved);
+        
         if let Some(fitness) = self.branch_fitness.get_mut(&active_expert_type) {
             if fear_resolved {
                 *fitness = (*fitness + 0.05).clamp(0.0, 1.0); // 奖励：缓解了恐惧
+                // 奖励 Token
+                if let Some(tokens) = self.token_allocation.get_mut(&active_expert_type) {
+                    *tokens += 100;
+                }
             } else {
                 *fitness = (*fitness - 0.05).clamp(0.0, 1.0); // 惩罚：未缓解恐惧
+                // 扣除额外惩罚 Token
+                if let Some(tokens) = self.token_allocation.get_mut(&active_expert_type) {
+                    *tokens -= 50;
+                }
             }
             
-            // 死亡判定 (Pruning)
+            // 死亡判定 (Pruning) 
             if *fitness <= 0.1 {
                 pruned_branches.push(active_expert_type.clone());
             }
         }
         
-        // 优胜劣汰：释放死亡分支的 Token 空间，按比例分配给幸存者
+        // 优胜劣汰：处理死亡分支
         for pruned in &pruned_branches {
-            if let Some(freed_tokens) = self.token_allocation.remove(pruned) {
-                // 将被剪枝的分支适应度设为 0 (逻辑死亡)
-                self.branch_fitness.insert(pruned.clone(), 0.0);
-                
-                // 将释放的 Token 平均分配给适应度最高的分支
-                let mut best_branch = "".to_string();
-                let mut max_fit = 0.0;
-                for (branch, fit) in &self.branch_fitness {
-                    if *fit > max_fit {
-                        max_fit = *fit;
-                        best_branch = branch.clone();
-                    }
-                }
-                
-                if !best_branch.is_empty() {
-                    if let Some(alloc) = self.token_allocation.get_mut(&best_branch) {
-                        *alloc += freed_tokens;
-                    }
-                }
-            }
+            // 触发 80/20 继承重组
+            self.respawn_expert(pruned);
         }
         
-        // 微突变：对所有存活分支的权重进行 +/- 0.001 级别的微调
+        // 微突变：使用动态突变率对所有存活分支的权重进行微调
         use rand::Rng;
         let mut rng = rand::thread_rng();
         for expert in &mut self.router.experts {
-            let mutation = rng.gen_range(-0.001..=0.001);
-            expert.weight = (expert.weight + mutation).clamp(0.0, 1.0);
+            // 如果刚刚被重组，不参与常规微调
+            if !pruned_branches.contains(&expert.expert_type) {
+                let mutation = rng.gen_range(-self.mutation_rate..=self.mutation_rate);
+                expert.weight = (expert.weight + mutation).clamp(0.0, 1.0);
+            }
         }
         
         pruned_branches

@@ -109,8 +109,8 @@ class DialogManager:
     def generate_response(self, user_input: str, active_expert: str = None) -> str:
         """生成大模型响应，结合相关历史记忆和路由的专家系统提示"""
         
-        # 1. 检索历史记忆
-        context = self.retriever.retrieve_context(user_input)
+        # 1. 检索历史记忆，并传入当前的 expert 以进行 context_tag 隔离
+        context = self.retriever.retrieve_context(user_input, active_expert=active_expert)
         
         # 2. 如果存在上一轮的级联记忆，也放入上下文中，以保证对话极强的连贯性
         recent_context = ""
@@ -128,7 +128,7 @@ class DialogManager:
             if "logic" in active_expert:
                 expert_prompt = "\n【当前激活专家：逻辑推理专家】请你对用户的问题进行严谨的逻辑分析，分步骤推导结论，指出其中的假设和潜在的矛盾。"
             elif "math" in active_expert:
-                expert_prompt = "\n【当前激活专家：数学计算专家】请你关注问题中的数值和计算逻辑，确保数学推导的绝对准确性。"
+                expert_prompt = "\n【当前激活专家：数学计算专家】请你关注问题中的数值和计算逻辑，确保数学推导的绝对准确性。如果遇到计算请求，请一步步展示计算过程。"
             elif "physics" in active_expert:
                 expert_prompt = "\n【当前激活专家：物理科学专家】请你运用物理定律和科学原理来解释用户的问题，注重因果关系和客观规律。"
             elif "memory" in active_expert:
@@ -149,8 +149,7 @@ class DialogManager:
         # 调用大模型生成文本，不需要 json 格式
         reply = call_llm(
             prompt=user_input, 
-            system_msg=system_msg,
-            response_format={"type": "text"}
+            system_msg=system_msg
         )
         return reply
         
@@ -212,7 +211,7 @@ class DialogManager:
                 # 如果当前处于恐惧脉冲状态，系统急需降低惊奇度，我们假设如果专家被选中，它成功“救场”
                 pruned = self.world_model.executor.evaluate_and_select(fear_resolved=self.fear_pulse_active, active_expert_type=top_expert)
                 if pruned:
-                    print(f"💀 [自然选择] 分支 {pruned} 在恐惧中表现不佳，已被彻底剪枝！Token 空间已释放。")
+                    print(f"💀 [自然选择] 分支 {pruned} 在恐惧中表现不佳，已被彻底剪枝并触发遗传重组！")
                     
                 # 既然专家已经接管并深度思考，系统恢复生命值
                 if self.fear_pulse_active:
@@ -225,7 +224,22 @@ class DialogManager:
             # 实时生成回应 (带有记忆检索)
             reply = self.generate_response(user_input, active_expert=top_expert)
             
-            # TODO: 真正的大模型预期应该由 LLM 在生成 reply 时一同给出，
+            # 使用反馈信号 (Feedback Signal)：根据恐惧缓解情况，调整刚才使用的历史记忆的 fitness
+            if top_expert and self.last_distilled_memory:
+                # 简单反馈逻辑：如果没能解决恐惧脉冲（惩罚），或者解决了（奖励）
+                # 这里我们假设 retrieval_context 里最近的一条记忆影响了本次决策，因此给予奖励/惩罚
+                if self.fear_pulse_active: # 如果依然恐惧，说明刚才检索的记忆没用好
+                    self.db_manager.adjust_memory_fitness(self.last_distilled_memory.memory_id, -0.1)
+                else:
+                    self.db_manager.adjust_memory_fitness(self.last_distilled_memory.memory_id, +0.1)
+            
+            # 扣除环境资源池能量
+            if top_expert:
+                tokens_used = bdm_rust.count_tokens(user_input + reply)
+                is_alive = self.world_model.executor.consume_energy(top_expert, tokens_used)
+                if not is_alive:
+                    print(f"⚡ [环境资源枯竭] 专家 {top_expert} 耗尽 Token 能量死亡！已触发 80/20 遗传重组...")
+            
             # 暂用当前输入作为下一轮的基准预测
             self.last_expected_embedding = current_embedding
         else:
@@ -236,7 +250,7 @@ class DialogManager:
             # 使用 LLM 生成轻量级响应，但不进行深度检索和专家路由，降低成本
             # 这里调用 LLM 生成符合上下文的短回复，而不是硬编码的“我明白了”
             system_msg_lite = "你是一个聪明的对话AI。用户说的话在你的意料之中，请简短地（不超过10个字）回应、附和或表示理解，保持对话流畅。"
-            reply = call_llm(prompt=user_input, system_msg=system_msg_lite, response_format={"type": "text"})
+            reply = call_llm(prompt=user_input, system_msg=system_msg_lite)
             
             self.last_expected_embedding = current_embedding
 
@@ -305,6 +319,12 @@ class DialogManager:
             all_memory_ids=all_memory_ids,  # 用于因果链接识别
             parent_contexts=parent_contexts # 引入血统因子，防止错误拦截
         )
+        
+        # 🚨 淘汰机制 (Selection Pressure): 如果蒸馏返回 None，说明没通过幻觉校验
+        if not distilled:
+            print(f"[自然选择] 💥 记忆块 [{chunk.chunk_id[:8]}] 未通过适应度校验，已被永久抛弃 (Dropped)！")
+            return
+            
         chunk.distilled_version = distilled
         
         self.memory_database.append(chunk)
@@ -351,8 +371,10 @@ class DialogManager:
         self.current_stream = []
 
     def run_forgetting_cycle(self):
-        """模拟后台运行的遗忘与状态更新周期"""
-        print("\n[系统后台] 开始执行动态遗忘与状态更新周期...")
+        """模拟后台运行的遗忘与状态更新周期 (淘汰机制)"""
+        print("\n[系统后台] 开始执行动态遗忘与淘汰周期...")
+        
+        # 1. 执行动态遗忘
         for i, chunk in enumerate(self.memory_database):
             old_status = chunk.status
             # 调用 Rust 实现的高性能状态更新算法
@@ -361,6 +383,13 @@ class DialogManager:
             
             if old_status != updated_chunk.status:
                 print(f"  -> 记忆块 [{updated_chunk.chunk_id[:8]}] 状态变更: {old_status} -> {updated_chunk.status}")
+                
+        # 2. 执行内存剪枝 (Pruning / Elimination)
+        pruned_count = self.db_manager.prune_memories(fitness_threshold=0.3)
+        if pruned_count > 0:
+            print(f"  -> [淘汰机制] 发现了 {pruned_count} 条 fitness < 0.3 的低质量记忆，已将其彻底淘汰出记忆图谱！")
+            self.retriever._rebuild_dag() # 剪枝后重建图谱
+            
         print("[系统后台] 周期执行完毕。\n")
 
     def run_evolution_cycle(self):

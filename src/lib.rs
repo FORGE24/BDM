@@ -32,14 +32,17 @@ pub struct DistilledMemory {
     // 热度衰减权重
     pub heat_score: f64,
     
-    // 逻辑推演标记：标志这段记忆是用户直接给出的事实，还是 MoE 专家(特别是逻辑专家)在预测编码期间推导出的结论
-    pub is_inference: bool,
+    // 2MNSAS 达尔文循环进化属性 (Darwinian Evolution Traits)
+    pub context_tag: String,      // 隔离上下文 (e.g., "math", "story", "reasoning")
+    pub fitness: f64,             // 适应度 (低于阈值会被淘汰)
+    pub success_rate: f64,        // 成功调用率
+    pub usage_count: usize,       // 历史调用次数
 }
 
 #[pymethods]
 impl DistilledMemory {
     #[new]
-    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None, parent_nodes=None, heat_score=1.0, is_inference=false))]
+    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None, parent_nodes=None, heat_score=1.0, context_tag="general", fitness=0.5, success_rate=0.5, usage_count=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         source_chunk_id: String,
@@ -57,7 +60,10 @@ impl DistilledMemory {
         embedding: Option<Vec<f64>>,
         parent_nodes: Option<Vec<String>>,
         heat_score: f64,
-        is_inference: bool,
+        context_tag: &str,
+        fitness: f64,
+        success_rate: f64,
+        usage_count: usize,
     ) -> Self {
         DistilledMemory {
             memory_id: Uuid::new_v4().to_string(),
@@ -76,7 +82,10 @@ impl DistilledMemory {
             embedding: embedding.unwrap_or_default(),
             parent_nodes: parent_nodes.unwrap_or_default(),
             heat_score,
-            is_inference,
+            context_tag: context_tag.to_string(),
+            fitness,
+            success_rate,
+            usage_count,
         }
     }
 }

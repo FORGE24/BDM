@@ -55,13 +55,16 @@ class DBDistilledMemory(Base):
     parent_nodes = Column(JSON, default=list)  # 前序节点 ID 列表
     child_nodes = Column(JSON, default=list)   # 后继节点 ID 列表
     
-    # 逻辑推演标记
-    is_inference = Column(Boolean, default=False)
+    # 2MNSAS 达尔文循环进化属性
+    context_tag = Column(String, default="general")
+    fitness = Column(Float, default=0.5)
+    success_rate = Column(Float, default=0.5)
     
-    # 热度衰减权重
+    # 热度衰减权重与访问记录
     heat_score = Column(Float, default=1.0)    # 初始热度分数
     last_accessed = Column(DateTime, default=datetime.now)  # 最后访问时间
     access_count = Column(Integer, default=0)   # 访问计数
+    usage_count = Column(Integer, default=0)    # 被作为有效上下文采纳的次数
     pruned = Column(Boolean, default=False)     # 是否被剪枝
     
     chunk = relationship("DBMemoryChunk", back_populates="distilled_memory")
@@ -82,6 +85,33 @@ class DatabaseManager:
         self.engine = create_engine(db_path, echo=False)
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
+        self._ensure_migrations()
+        
+    def _ensure_migrations(self):
+        """确保数据库模式是最新的 (简单的自动迁移)"""
+        try:
+            with self.engine.connect() as conn:
+                from sqlalchemy import text
+                columns = conn.execute(text("PRAGMA table_info(distilled_memories)")).fetchall()
+                column_names = [col[1] for col in columns]
+                
+                # 迁移 2MNSAS 的新字段
+                if "context_tag" not in column_names:
+                    print("[数据库迁移] 正在添加缺失的列: context_tag...")
+                    conn.execute(text("ALTER TABLE distilled_memories ADD COLUMN context_tag TEXT DEFAULT 'general'"))
+                if "fitness" not in column_names:
+                    print("[数据库迁移] 正在添加缺失的列: fitness...")
+                    conn.execute(text("ALTER TABLE distilled_memories ADD COLUMN fitness FLOAT DEFAULT 0.5"))
+                if "success_rate" not in column_names:
+                    print("[数据库迁移] 正在添加缺失的列: success_rate...")
+                    conn.execute(text("ALTER TABLE distilled_memories ADD COLUMN success_rate FLOAT DEFAULT 0.5"))
+                if "usage_count" not in column_names:
+                    print("[数据库迁移] 正在添加缺失的列: usage_count...")
+                    conn.execute(text("ALTER TABLE distilled_memories ADD COLUMN usage_count INTEGER DEFAULT 0"))
+                    
+                conn.commit()
+        except Exception as e:
+            print(f"[数据库迁移错误]: {e}")
         
     def get_session(self):
         return self.Session()
@@ -127,7 +157,10 @@ class DatabaseManager:
                     generation_cost=dist.generation_cost,
                     parent_nodes=getattr(dist, 'parent_nodes', []),
                     heat_score=getattr(dist, 'heat_score', 1.0),
-                    is_inference=getattr(dist, 'is_inference', False),
+                    context_tag=getattr(dist, 'context_tag', 'general'),
+                    fitness=getattr(dist, 'fitness', 0.5),
+                    success_rate=getattr(dist, 'success_rate', 0.5),
+                    usage_count=getattr(dist, 'usage_count', 0),
                     access_count=0
                 )
                 session.add(db_distilled)
@@ -184,7 +217,10 @@ class DatabaseManager:
                         embedding=db_dist.embedding,
                         parent_nodes=db_dist.parent_nodes,
                         heat_score=db_dist.heat_score,
-                        is_inference=db_dist.is_inference
+                        context_tag=db_dist.context_tag,
+                        fitness=db_dist.fitness,
+                        success_rate=db_dist.success_rate,
+                        usage_count=db_dist.usage_count
                     )
                     dist.memory_id = db_dist.memory_id
                     chunk.distilled_version = dist
@@ -216,7 +252,39 @@ class DatabaseManager:
         finally:
             session.close()
             
-    def save_consolidated_block(self, block_info: dict):
+    def adjust_memory_fitness(self, memory_id: str, delta: float):
+        """调整记忆的 fitness 分数 (反馈信号)"""
+        session = self.get_session()
+        try:
+            db_dist = session.query(DBDistilledMemory).filter_by(memory_id=memory_id).first()
+            if db_dist:
+                db_dist.fitness = max(0.0, min(1.0, db_dist.fitness + delta))
+                session.commit()
+        except Exception as e:
+            print(f"调整记忆 fitness 失败: {e}")
+            session.rollback()
+        finally:
+            session.close()
+
+    def prune_memories(self, fitness_threshold: float = 0.3):
+        """清理低适应度的记忆 (淘汰机制)"""
+        session = self.get_session()
+        try:
+            # 找到所有适应度低于阈值的记忆
+            low_fitness_mems = session.query(DBDistilledMemory).filter(DBDistilledMemory.fitness < fitness_threshold).all()
+            pruned_count = 0
+            for mem in low_fitness_mems:
+                mem.pruned = True
+                pruned_count += 1
+                
+            session.commit()
+            return pruned_count
+        except Exception as e:
+            print(f"剪枝记忆失败: {e}")
+            session.rollback()
+            return 0
+        finally:
+            session.close()
         """保存合并生成的巩固块"""
         session = self.get_session()
         try:

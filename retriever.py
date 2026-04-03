@@ -51,26 +51,51 @@ class MemoryRetriever:
             return 0.0
         return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
     
-    def retrieve_context(self, query: str, limit: int = 3, max_tokens: int = 512, return_nodes: bool = False):
+    def retrieve_context(self, query: str, limit: int = 3, max_tokens: int = 512, return_nodes: bool = False, active_expert: str = None):
         """
-        【升级】拓扑启发式检索：
-        1. 向量相似度定位目标节点
-        2. DAG 回溯：沿着父节点向上遍历
-        3. Token 分配：当前70% + 父20% + 祖先10%
-        4. 协议化符号输出：Ref[A->C->D]: {content}
+        【升级】拓扑启发式检索与 2MNSAS 上下文隔离 (Context Isolation)：
+        1. 根据当前激活的专家 (active_expert) 确定查询的 context_tag 类别。
+        2. 严格过滤掉 fitness < 0.7 的低质量记忆，防止污染。
+        3. 向量相似度定位目标节点。
+        4. DAG 回溯：沿着父节点向上遍历。
+        5. Token 分配：当前70% + 父20% + 祖先10%
+        6. 协议化符号输出：Ref[A->C->D]: {content}
         """
         session = self.db_manager.get_session()
         try:
             from database import DBDistilledMemory
             
-            # Step 1: 向量相似度搜索找到最相关的节点
+            # Step 1: 确定查询的 context_tag 类别
+            target_context_tag = "general"
+            if active_expert:
+                if "math" in active_expert:
+                    target_context_tag = "math"
+                elif "logic" in active_expert:
+                    target_context_tag = "reasoning"
+                elif "physics" in active_expert or "memory" in active_expert:
+                    target_context_tag = "story"
+            
+            # Step 2: 严格过滤与打分
             query_embedding = self.embedding_model.encode(query).tolist()
-            all_memories = session.query(DBDistilledMemory).filter_by(pruned=False).all()
+            # 核心过滤：只允许高质量 (fitness >= 0.7) 且未被剪枝的记忆参与检索
+            # 如果提供了 active_expert，则优先或者强制匹配 context_tag，这里我们采取软匹配加权策略
+            all_memories = session.query(DBDistilledMemory).filter(
+                DBDistilledMemory.pruned == False,
+                DBDistilledMemory.fitness >= 0.7
+            ).all()
             
             scored_memories = []
             for memory in all_memories:
                 vector_score = self._cosine_similarity(query_embedding, memory.embedding) if memory.embedding else 0.0
-                scored_memories.append((vector_score, memory))
+                
+                # Context Isolation 奖励：如果 tag 匹配，大幅提升分数；如果不匹配，极大地惩罚分数
+                if memory.context_tag == target_context_tag:
+                    vector_score += 0.5  # Tag 匹配奖励
+                elif target_context_tag != "general" and memory.context_tag != "general":
+                    vector_score -= 0.8  # 跨界污染惩罚 (例如 math 问题不该检索 story 记忆)
+                
+                if vector_score > 0.3: # 最低相似度阈值
+                    scored_memories.append((vector_score, memory))
             
             scored_memories.sort(key=lambda x: x[0], reverse=True)
             
@@ -80,6 +105,10 @@ class MemoryRetriever:
             # 取最相关的节点作为起点
             top_memory = scored_memories[0][1]
             target_node_id = top_memory.memory_id
+            
+            # 记录该记忆被作为检索起点成功采纳 (usage_count + 1)
+            top_memory.usage_count += 1
+            session.commit()
             
             # Step 2: DAG 拓扑检索 - 沿着 parent_nodes 向上回溯
             retrieval_chain = self.dag.heuristic_retrieval(target_node_id, max_depth=2, max_tokens=max_tokens)

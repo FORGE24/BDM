@@ -25,16 +25,19 @@ client = OpenAI(
     base_url="https://api.deepseek.com/v1"
 )
 
-def call_llm(prompt: str, model: str = "deepseek-chat", response_format: dict = {"type": "json_object"}, system_msg: str = "你是一个高度智能的系统结构化摘要引擎。") -> str:
+def call_llm(prompt: str, model: str = "deepseek-chat", response_format: dict = None, system_msg: str = "你是一个高度智能的系统结构化摘要引擎。") -> str:
     """调用 Deepseek API 生成回复"""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
+    kwargs = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": prompt}
-        ],
-        response_format=response_format
-    )
+        ]
+    }
+    if response_format:
+        kwargs["response_format"] = response_format
+        
+    response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
 def self_validate_summary(summary_json: dict, raw_text: str, parent_contexts: str = "") -> tuple[bool, str]:
@@ -82,7 +85,7 @@ def self_validate_summary(summary_json: dict, raw_text: str, parent_contexts: st
     """
     
     try:
-        eval_str = call_llm(prompt, system_msg="你是一个理性的质量检查员。你懂得区分什么是'上下文继承'，什么是'无中生有的幻觉'。")
+        eval_str = call_llm(prompt, response_format={"type": "json_object"}, system_msg="你是一个理性的质量检查员。你懂得区分什么是'上下文继承'，什么是'无中生有的幻觉'。")
         eval_json = json.loads(eval_str)
         return eval_json.get("passed", True), eval_json.get("reason", "未提供原因")
     except Exception as e:
@@ -114,8 +117,13 @@ def self_distillation(chunk: MemoryChunk, all_memory_ids: list = None, parent_co
     2. 区分【用户故事内容】、【系统运行状态】和【逻辑推演】。
        - 将故事实体放在 `entities` 中。
        - 将系统运行状态（如：激活了某个专家、MLED系统状态）提取到 `metadata` 中。
-       - **极其重要**：如果是AI（特别是逻辑推理专家）基于事实做出的**逻辑推断、假设或补充设定**，请将其放入 `inferences` 字段，并在根级别设置 `"is_inference": true`。
+       - **极其重要**：如果是AI（特别是逻辑推理专家）基于事实做出的**逻辑推断、假设或补充设定**，请将其放入 `inferences` 字段。
     3. 提取的信息必须能够追溯到当前对话或父节点上下文中，或者是基于这些上下文的合理推演。
+    4. **环境分类 (context_tag)**：你必须将当前对话的语境分类为以下之一：
+       - "math" (涉及计算、数字、物理等)
+       - "story" (涉及剧情、人物、科幻设定等)
+       - "reasoning" (涉及逻辑分析、为什么、假设推导等)
+       - "general" (普通的日常对话，无明显特征)
     """
     
     prompt = f"""
@@ -140,7 +148,7 @@ def self_distillation(chunk: MemoryChunk, all_memory_ids: list = None, parent_co
         "inferences": ["推论1", "推论2", ...],
         "metadata": ["系统状态快照1", "使用的专家模块", ...],
         "parent_nodes": ["前序记忆块ID1", ...],
-        "is_inference": true 或 false
+        "context_tag": "math/story/reasoning/general"
     }}
     """
     
@@ -150,7 +158,7 @@ def self_distillation(chunk: MemoryChunk, all_memory_ids: list = None, parent_co
     
     for attempt in range(max_retries + 1):
         try:
-            summary_str = call_llm(prompt, system_msg=system_msg)
+            summary_str = call_llm(prompt, response_format={"type": "json_object"}, system_msg=system_msg)
             structured_summary = json.loads(summary_str)
             
             is_valid, reason = self_validate_summary(structured_summary, chunk.raw_text, parent_contexts)
@@ -159,20 +167,14 @@ def self_distillation(chunk: MemoryChunk, all_memory_ids: list = None, parent_co
                 
             print(f"[蒸馏自校验拦截] 第 {attempt + 1} 次尝试失败: {reason}")
             if attempt == max_retries:
-                print("[蒸馏自校验] 重试耗尽，启动【模糊保存模式】 (Fuzzy Save Mode)")
-                structured_summary["_uncertainty_flag"] = True
-                structured_summary["_validation_failure_reason"] = reason
+                print("🚨 [蒸馏自校验] 重试耗尽，启动【自然选择淘汰机制】(Selection Pressure) -> 直接丢弃该记忆！")
+                return None  # 返回 None，意味着放弃该记忆的保存
             else:
                 prompt += f"\n\n[上一次提取失败原因]：{reason}\n请严格修正，去除真正的幻觉，但保留合法的继承上下文！"
                 
         except Exception as e:
             print(f"自蒸馏解析失败: {e}")
-            structured_summary = {
-                "entities": [], "decisions": [], "actions": [], 
-                "preferences": [], "important_facts": [], "parent_nodes": [],
-                "_uncertainty_flag": True, "_error": str(e)
-            }
-            break
+            return None
             
     # 生成向量嵌入 (Vector Embedding)
     # 将推论 inferences 也加入到向量化文本中
@@ -199,7 +201,10 @@ def self_distillation(chunk: MemoryChunk, all_memory_ids: list = None, parent_co
         embedding=embedding_vector,
         parent_nodes=structured_summary.get("parent_nodes", []),
         heat_score=1.0,
-        is_inference=structured_summary.get("is_inference", False)
+        context_tag=structured_summary.get("context_tag", "general"),
+        fitness=0.8,        # 初始适应度
+        success_rate=0.5,
+        usage_count=0
     )
     
     return distilled
