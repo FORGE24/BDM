@@ -71,11 +71,14 @@ def lower_compression(current_level: str) -> str:
         return "low"
     return "low"
 
-def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = None, compression_level: str = "balanced", max_retries: int = 1) -> DistilledMemory:
+def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = None, compression_level: str = "balanced", max_retries: int = 1, all_memory_ids: list = None) -> DistilledMemory:
     """
-    结构化自蒸馏：从原始对话块提取结构化摘要。
+    结构化自蒸馏：从原始对话块提取结构化摘要 + 因果链接。
     如果提供了 previous_distilled，则将其纳入上下文，使新记忆继承上一轮的50%精华。
     """
+    if all_memory_ids is None:
+        all_memory_ids = []
+    
     compression_prompts = {
         "high": "生成极简摘要(50-100 tokens)，只保留核心决策",
         "balanced": "生成标准摘要(100-200 tokens)，保留关键信息",
@@ -92,12 +95,19 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
     - 偏好: {previous_distilled.preferences}
         """
     
+    # 构建可用的 memory_id 列表作为参考
+    available_refs = json.dumps(all_memory_ids[-10:]) if all_memory_ids else "[]"  # 只包含最近10个
+    
     prompt = f"""
-    请对以下对话进行结构化摘要：
+    请对以下对话进行结构化摘要并识别因果依赖关系：
     {prev_context}
     
     [本次原始对话]：
     {chunk.raw_text}
+    
+    【重要】：识别因果链接 - 这个记忆块依赖于哪些前序节点？
+    可用的前序记忆块 ID: {available_refs}
+    如果本记忆与之前的记忆有因果关系，请选择最多 3 个父节点。
     
     请严格按照以下JSON格式输出（必须返回JSON格式）：
     {{
@@ -107,7 +117,8 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
         "preferences": ["偏好1", "偏好2", ...],
         "code_snippets": ["代码片段1", "代码片段2", ...],
         "important_facts": ["事实1", "事实2", ...],
-        "constraints": ["约束1", "约束2", ...]
+        "constraints": ["约束1", "约束2", ...],
+        "parent_nodes": ["前序记忆块ID1", "前序记忆块ID2"]  【新增】：因果链接
     }}
     
     要求：{compression_prompts.get(compression_level, compression_prompts["balanced"])}
@@ -126,7 +137,7 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
                 new_level = lower_compression(compression_level)
                 print(f"[蒸馏自校验] 尝试降低压缩率({new_level})并重试...")
                 # 惩罚一次重试带来的保真度降低
-                retried_distilled = self_distillation(chunk, previous_distilled, new_level, max_retries - 1)
+                retried_distilled = self_distillation(chunk, previous_distilled, new_level, max_retries - 1, all_memory_ids)
                 retried_distilled.fidelity_score = 0.8
                 return retried_distilled
             else:
@@ -148,10 +159,14 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
             code_snippets=structured_summary.get("code_snippets", []),
             important_facts=structured_summary.get("important_facts", []),
             constraints=structured_summary.get("constraints", []),
-            compression_ratio=len(summary_str) / max(1, chunk.tokens),
+            compression_ratio=0.5 if compression_level == "high" else (0.3 if compression_level=="balanced" else 0.1),
             fidelity_score=fidelity_score,
-            embedding=embedding_vector
+            generation_cost=0,
+            embedding=embedding_vector,
+            parent_nodes=structured_summary.get("parent_nodes", []),  # 【新增】：从 LLM 输出解析
+            heat_score=1.0  # 初始热度分数
         )
+        
         return distilled
     except Exception as e:
         print(f"自蒸馏失败: {e}")

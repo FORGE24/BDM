@@ -51,6 +51,16 @@ class DBDistilledMemory(Base):
     fidelity_score = Column(Float, default=1.0)
     generation_cost = Column(Integer, default=0)
     
+    # DAG 因果关联 (Causal Linking)
+    parent_nodes = Column(JSON, default=list)  # 前序节点 ID 列表
+    child_nodes = Column(JSON, default=list)   # 后继节点 ID 列表
+    
+    # 热度衰减权重
+    heat_score = Column(Float, default=1.0)    # 初始热度分数
+    last_accessed = Column(DateTime, default=datetime.now)  # 最后访问时间
+    access_count = Column(Integer, default=0)   # 访问计数
+    pruned = Column(Boolean, default=False)     # 是否被剪枝
+    
     chunk = relationship("DBMemoryChunk", back_populates="distilled_memory")
 
 
@@ -101,7 +111,10 @@ class DatabaseManager:
                     embedding=dist.embedding,
                     compression_ratio=dist.compression_ratio,
                     fidelity_score=dist.fidelity_score,
-                    generation_cost=dist.generation_cost
+                    generation_cost=dist.generation_cost,
+                    parent_nodes=getattr(dist, 'parent_nodes', []),
+                    heat_score=1.0,
+                    access_count=0
                 )
                 session.add(db_distilled)
                 

@@ -2,6 +2,11 @@ use pyo3::prelude::*;
 use tiktoken_rs::cl100k_base;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use std::collections::{HashMap, VecDeque};
+
+mod advanced;
+
+// ============= 数据结构定义 =============
 
 #[pyclass(module = "bdm_rust", get_all, set_all)]
 #[derive(Clone)]
@@ -20,12 +25,18 @@ pub struct DistilledMemory {
     pub fidelity_score: f64,
     pub generation_cost: usize,
     pub embedding: Vec<f64>,
+    
+    // DAG 因果链接 (Causal Linking)
+    pub parent_nodes: Vec<String>,
+    
+    // 热度衰减权重
+    pub heat_score: f64,
 }
 
 #[pymethods]
 impl DistilledMemory {
     #[new]
-    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None))]
+    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None, parent_nodes=None, heat_score=1.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         source_chunk_id: String,
@@ -41,6 +52,8 @@ impl DistilledMemory {
         fidelity_score: f64,
         generation_cost: usize,
         embedding: Option<Vec<f64>>,
+        parent_nodes: Option<Vec<String>>,
+        heat_score: f64,
     ) -> Self {
         DistilledMemory {
             memory_id: Uuid::new_v4().to_string(),
@@ -57,6 +70,8 @@ impl DistilledMemory {
             fidelity_score,
             generation_cost,
             embedding: embedding.unwrap_or_default(),
+            parent_nodes: parent_nodes.unwrap_or_default(),
+            heat_score,
         }
     }
 }
@@ -125,6 +140,206 @@ impl ChunkingConfig {
             max_tokens,
             overlap_tokens,
         }
+    }
+}
+
+// ============= DAG 结构和算法 =============
+
+/// DAG 节点表示 (节点 = 蒸馏记忆块)
+#[derive(Clone, Debug)]
+pub struct DAGNode {
+    pub memory_id: String,
+    pub source_chunk_id: String,
+    pub parent_nodes: Vec<String>,  // 父节点 ID 列表
+    pub heat_score: f64,             // 热度评分
+    pub access_count: usize,         // 访问次数
+    pub token_length: usize,         // 内容长度 (token)
+    pub distilled_content: String,   // 蒸馏摘要简单表示
+}
+
+/// DAG 图结构 - 用于拓扑检索
+#[pyclass(module = "bdm_rust")]
+pub struct MemoryDAG {
+    pub nodes: HashMap<String, DAGNode>,
+    pub adjacency_list: HashMap<String, Vec<String>>, // 正向邻接表 (child)
+    pub reverse_adjacency: HashMap<String, Vec<String>>, // 反向邻接表 (parent)
+}
+
+#[pymethods]
+impl MemoryDAG {
+    #[new]
+    fn new() -> Self {
+        MemoryDAG {
+            nodes: HashMap::new(),
+            adjacency_list: HashMap::new(),
+            reverse_adjacency: HashMap::new(),
+        }
+    }
+
+    /// 添加节点
+    fn add_node(&mut self, memory_id: String, parent_nodes: Vec<String>, heat_score: f64, access_count: usize, token_length: usize, distilled_content: String) {
+        let node = DAGNode {
+            memory_id: memory_id.clone(),
+            source_chunk_id: memory_id.clone(),
+            parent_nodes: parent_nodes.clone(),
+            heat_score,
+            access_count,
+            token_length,
+            distilled_content,
+        };
+        
+        self.nodes.insert(memory_id.clone(), node);
+        
+        // 构建邻接表
+        self.adjacency_list.entry(memory_id.clone()).or_insert_with(Vec::new);
+        self.reverse_adjacency.entry(memory_id.clone()).or_insert_with(Vec::new);
+        
+        // 建立父子关系
+        for parent_id in parent_nodes.iter() {
+            self.adjacency_list
+                .entry(parent_id.clone())
+                .or_insert_with(Vec::new)
+                .push(memory_id.clone());
+            
+            self.reverse_adjacency
+                .entry(memory_id.clone())
+                .or_insert_with(Vec::new)
+                .push(parent_id.clone());
+        }
+    }
+
+    /// 拓扑启发式检索：给定目标节点，沿着 DAG 向上回溯，返回上下文链
+    /// 返回格式: [(node_id, depth, distance, token_allocation), ...]
+    fn heuristic_retrieval(&self, target_node_id: String, max_depth: i32, max_tokens: i32) -> Vec<(String, i32, i32, i32)> {
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = VecDeque::new();
+        
+        queue.push_back((target_node_id.clone(), 0, 0)); // (node_id, depth, distance)
+        visited.insert(target_node_id.clone());
+        
+        // BFS 向上回溯
+        while let Some((node_id, depth, distance)) = queue.pop_front() {
+            if depth > max_depth {
+                continue;
+            }
+            
+            if let Some(node) = self.nodes.get(&node_id) {
+                // Token 分配策略：远疏近亲
+                // 深度 0 (当前): 70% tokens
+                // 深度 1 (父): 20% tokens
+                // 深度 2+ (祖先): 10% tokens
+                let token_allocation = match depth {
+                    0 => (max_tokens as f64 * 0.7) as i32,
+                    1 => (max_tokens as f64 * 0.2) as i32,
+                    _ => (max_tokens as f64 * 0.1) as i32,
+                };
+                
+                result.push((node_id.clone(), depth, distance, token_allocation));
+                
+                // 加入父节点到队列
+                if let Some(parents) = self.reverse_adjacency.get(&node_id) {
+                    for parent_id in parents.iter() {
+                        if !visited.contains(parent_id) {
+                            visited.insert(parent_id.clone());
+                            queue.push_back((parent_id.clone(), depth + 1, distance + 1));
+                        }
+                    }
+                }
+            }
+        }
+        
+        result
+    }
+    
+    /// 获取节点的完整上下文链 (用于符号协议输出)
+    /// 返回格式: "Ref[A->C->D]: content"
+    fn get_context_chain(&self, target_node_id: String) -> String {
+        let mut chain = vec![target_node_id.clone()];
+        let mut current = &target_node_id;
+        
+        // 向上回溯到根节点
+        let mut iterations = 0;
+        while iterations < 100 {
+            if let Some(parents) = self.reverse_adjacency.get(current) {
+                if !parents.is_empty() {
+                    current = &parents[0]; // 取第一个父节点
+                    chain.insert(0, current.clone());
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+            iterations += 1;
+        }
+        
+        // 格式化为符号协议
+        let chain_str = chain.join("->");
+        format!("Ref[{}]", chain_str)
+    }
+}
+
+// ============= 热度衰减算法 (Pagerank-like with Heat Decay) =============
+
+/// 热度衰减算法 - 给节点计算热度分数
+#[pyclass(module = "bdm_rust")]
+pub struct HeatDecayEngine {
+    pub decay_factor: f64,         // 衰减因子 (0.0 - 1.0)
+    pub recency_weight: f64,       // 最近访问权重
+    pub access_freq_weight: f64,   // 访问频率权重
+    pub relation_weight: f64,      // 关系权重
+}
+
+#[pymethods]
+impl HeatDecayEngine {
+    #[new]
+    #[pyo3(signature = (decay_factor=0.95, recency_weight=0.4, access_freq_weight=0.3, relation_weight=0.3))]
+    fn new(decay_factor: f64, recency_weight: f64, access_freq_weight: f64, relation_weight: f64) -> Self {
+        HeatDecayEngine {
+            decay_factor,
+            recency_weight,
+            access_freq_weight,
+            relation_weight,
+        }
+    }
+
+    /// 计算单个节点的热度分数
+    /// 输入: (access_count, days_since_access, parent_count, is_referenced)
+    /// 输出: 热度分数 (0.0 - 1.0)
+    fn calculate_heat_score(&self, access_count: usize, days_since_access: f64, parent_count: usize, is_referenced: bool) -> f64 {
+        // 最近访问权重 (时间衰减)
+        let recency_score = (1.0 / (1.0 + days_since_access / 7.0)).clamp(0.0, 1.0); // 7天为衰减半周期
+        
+        // 访问频率权重 (对数平滑)
+        let access_score = ((access_count as f64).ln() / 10.0).clamp(0.0, 1.0);
+        
+        // 关系权重 (父节点或被引用则提升)
+        let relation_score = if parent_count > 0 || is_referenced { 0.8 } else { 0.3 };
+        
+        let heat = (self.recency_weight * recency_score) +
+                   (self.access_freq_weight * access_score) +
+                   (self.relation_weight * relation_score);
+        
+        heat.clamp(0.0, 1.0)
+    }
+
+    /// Pagerank-like 热度传播算法
+    /// 返回需要剪枝的节点 ID 列表 (热度低于阈值)
+    fn identify_pruning_candidates(&self, node_scores: Vec<(String, f64)>, pruning_threshold: f64) -> Vec<String> {
+        node_scores
+            .into_iter()
+            .filter(|(_, score)| *score < pruning_threshold)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// 热度衰减迭代 (每次调用表示一个时间步)
+    fn decay_iteration(&self, heat_scores: Vec<f64>) -> Vec<f64> {
+        heat_scores
+            .into_iter()
+            .map(|h| h * self.decay_factor)
+            .collect()
     }
 }
 
@@ -275,10 +490,27 @@ fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
 /// A Python module implemented in Rust.
 #[pymodule]
 fn bdm_rust(_py: Python, m: &PyModule) -> PyResult<()> {
+    // Core structures
     m.add_class::<DistilledMemory>()?;
     m.add_class::<MemoryChunk>()?;
     m.add_class::<ChunkingConfig>()?;
     m.add_class::<DynamicForgetting>()?;
+    m.add_class::<MemoryDAG>()?;
+    m.add_class::<HeatDecayEngine>()?;
+    
+    // Advanced features - Predictive Coding & Sparse Impulse
+    m.add_class::<advanced::NeuralSpike>()?;
+    m.add_class::<advanced::SurpriseFilter>()?;
+    
+    // Advanced features - Local Consolidation
+    m.add_class::<advanced::ConsolidatedBlock>()?;
+    m.add_class::<advanced::LocalConsolidationEngine>()?;
+    
+    // Advanced features - MoE World Model
+    m.add_class::<advanced::MoERouter>()?;
+    m.add_class::<advanced::WorldModelExecutor>()?;
+    
+    // Functions
     m.add_function(wrap_pyfunction!(intelligent_chunking, m)?)?;
     m.add_function(wrap_pyfunction!(count_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;

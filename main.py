@@ -143,8 +143,16 @@ class DialogManager:
         print(f"\n[系统] 智能分块触发！形成新记忆块 (Token数: {chunk.tokens}, 语义边界: {chunk.semantic_boundary})")
         print(f"[系统] 正在触发级联自蒸馏机制... (将融合上一轮 50% 的记忆精华)")
         
-        # 调用基于 Deepseek API 的自蒸馏引擎，并传入上一轮的记忆
-        distilled = self_distillation(chunk, previous_distilled=self.last_distilled_memory, compression_level="balanced")
+        # 【新增】构建所有已有记忆块的 ID 列表
+        all_memory_ids = [c.chunk_id for c in self.memory_database if hasattr(c, 'chunk_id')]
+        
+        # 调用基于 Deepseek API 的自蒸馏引擎，并传入上一轮的记忆和所有 memory_ids
+        distilled = self_distillation(
+            chunk, 
+            previous_distilled=self.last_distilled_memory, 
+            compression_level="balanced",
+            all_memory_ids=all_memory_ids  # 【新增】：用于因果链接识别
+        )
         chunk.distilled_version = distilled
         
         self.memory_database.append(chunk)
@@ -155,6 +163,8 @@ class DialogManager:
         # 将记忆存入 SQLite 数据库
         if self.db_manager.save_memory_chunk(chunk):
             print("[系统] 记忆已持久化至 SQLite 数据库 (mled_memory.db)")
+            # 【新增】更新检索器的 DAG 图
+            self.retriever._rebuild_dag()
         else:
             print("[系统] ⚠️ 记忆持久化失败！")
         
@@ -162,6 +172,7 @@ class DialogManager:
         print(f"提取实体: {distilled.entities}")
         print(f"关键决策: {distilled.decisions}")
         print(f"事实与信息: {distilled.important_facts}")
+        print(f"因果链接 (父节点): {distilled.parent_nodes}")  # 【新增】显示因果链接
         print("======================\n")
         
     def _flush_current_chunk(self):

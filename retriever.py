@@ -2,16 +2,44 @@ import numpy as np
 from database import DatabaseManager
 from memory import DistilledMemory
 from sentence_transformers import SentenceTransformer
+import bdm_rust
+import json
 
 class MemoryRetriever:
-    """混合检索器：关键字匹配 + 向量相似度 (MVP 版本)"""
+    """混合检索器：向量相似度 + DAG 拓扑启发式回溯"""
     
     def __init__(self, db_manager: DatabaseManager, vector_weight: float = 0.7, keyword_weight: float = 0.3):
         self.db_manager = db_manager
         self.vector_weight = vector_weight
         self.keyword_weight = keyword_weight
-        # 初始化与 distiller 中相同的嵌入模型
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # 初始化 DAG 结构
+        self.dag = bdm_rust.MemoryDAG()
+        self.heat_decay_engine = bdm_rust.HeatDecayEngine()
+        self._rebuild_dag()
+        
+    def _rebuild_dag(self):
+        """从数据库重建 DAG 图结构"""
+        session = self.db_manager.get_session()
+        try:
+            from database import DBDistilledMemory
+            all_memories = session.query(DBDistilledMemory).all()
+            
+            for memory in all_memories:
+                parent_nodes = memory.parent_nodes or []
+                self.dag.add_node(
+                    memory_id=memory.memory_id,
+                    parent_nodes=parent_nodes,
+                    heat_score=memory.heat_score,
+                    access_count=memory.access_count,
+                    token_length=100,  # 簡化估計
+                    distilled_content=str(memory.important_facts)[:200]
+                )
+        except Exception as e:
+            print(f"[DAG 重建失败] {e}")
+        finally:
+            session.close()
         
     def _cosine_similarity(self, v1, v2):
         """计算余弦相似度"""
@@ -22,70 +50,83 @@ class MemoryRetriever:
         if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
             return 0.0
         return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-        
-    def retrieve_context(self, query: str, limit: int = 3) -> str:
+    
+    def retrieve_context(self, query: str, limit: int = 3, max_tokens: int = 512) -> str:
         """
-        检索相关的记忆块，组装为上下文字符串。
-        结合了简单的子串匹配与向量相似度计算。
+        【升级】拓扑启发式检索：
+        1. 向量相似度定位目标节点
+        2. DAG 回溯：沿着父节点向上遍历
+        3. Token 分配：当前70% + 父20% + 祖先10%
+        4. 协议化符号输出：Ref[A->C->D]: {content}
         """
         session = self.db_manager.get_session()
         try:
-            # 1. 生成查询的向量
-            query_embedding = self.embedding_model.encode(query).tolist()
-            
-            # 获取所有存储的蒸馏记忆
             from database import DBDistilledMemory
-            all_memories = session.query(DBDistilledMemory).all()
+            
+            # Step 1: 向量相似度搜索找到最相关的节点
+            query_embedding = self.embedding_model.encode(query).tolist()
+            all_memories = session.query(DBDistilledMemory).filter_by(pruned=False).all()
             
             scored_memories = []
-            
             for memory in all_memories:
-                keyword_score = 0
-                
-                # 关键字匹配得分
-                fields_to_search = [
-                    memory.entities,
-                    memory.decisions,
-                    memory.important_facts,
-                    memory.preferences
-                ]
-                
-                for field in fields_to_search:
-                    if field:
-                        for item in field:
-                            if item in query or any(q in item for q in query.split() if len(q)>1):
-                                keyword_score += 1
-                
-                # 向量相似度得分
-                vector_score = 0.0
-                if memory.embedding and len(memory.embedding) > 0:
-                    vector_score = self._cosine_similarity(query_embedding, memory.embedding)
-                    
-                # 归一化关键词得分 (假设最高分为10，简单处理)
-                normalized_keyword = min(1.0, keyword_score / 5.0)
-                
-                # 综合打分
-                final_score = (self.vector_weight * vector_score) + (self.keyword_weight * normalized_keyword)
-                
-                if final_score > 0.1: # 设定一个最低阈值
-                    scored_memories.append((final_score, memory))
-                    
-            # 排序并取前 N 个
-            scored_memories.sort(key=lambda x: x[0], reverse=True)
-            top_memories = [m for s, m in scored_memories[:limit]]
+                vector_score = self._cosine_similarity(query_embedding, memory.embedding) if memory.embedding else 0.0
+                scored_memories.append((vector_score, memory))
             
-            if not top_memories:
+            scored_memories.sort(key=lambda x: x[0], reverse=True)
+            
+            if not scored_memories:
+                return "（无相关历史记忆）"
+            
+            # 取最相关的节点作为起点
+            top_memory = scored_memories[0][1]
+            target_node_id = top_memory.memory_id
+            
+            # Step 2: DAG 拓扑检索 - 沿着 parent_nodes 向上回溯
+            retrieval_chain = self.dag.heuristic_retrieval(target_node_id, max_depth=2, max_tokens=max_tokens)
+            
+            # Step 3: 构建上下文 - Token 分配和协议化符号
+            context_parts = []
+            total_tokens = 0
+            
+            for node_id, depth, distance, token_allocation in retrieval_chain:
+                # 查询该节点的详细内容
+                node_memory = session.query(DBDistilledMemory).filter_by(memory_id=node_id).first()
+                if not node_memory:
+                    continue
+                
+                # 获取符号协议链
+                context_chain = self.dag.get_context_chain(node_id)
+                
+                # 根据深度生成摘要
+                if depth == 0:
+                    # 当前节点 - 70% 详细
+                    content = f"【核心记忆】\n" \
+                             f"- 实体: {node_memory.entities[:3]}\n" \
+                             f"- 决策: {node_memory.decisions[:2]}\n" \
+                             f"- 事实: {node_memory.important_facts[:3]}"
+                elif depth == 1:
+                    # 父节点 - 20% 摘要
+                    content = f"【直接依赖】\n" \
+                             f"- 关键决策: {node_memory.decisions[:1]}\n" \
+                             f"- 关键事实: {node_memory.important_facts[:1]}"
+                else:
+                    # 祖节点 - 10% 关键词锚点
+                    keywords = (node_memory.entities[:1] if node_memory.entities else []) + \
+                               (node_memory.decisions[:1] if node_memory.decisions else [])
+                    content = f"【历史背景】\n- 关键词: {keywords}"
+                
+                # 格式化为协议化符号
+                formatted = f"{context_chain}: {content}"
+                context_parts.append(formatted)
+                total_tokens += token_allocation
+                
+                if total_tokens >= max_tokens:
+                    break
+            
+            if not context_parts:
                 return "（无相关历史记忆）"
                 
-            context_parts = []
-            for m in top_memories:
-                part = f"- 曾提及实体: {m.entities}\n" \
-                       f"  关键决策: {m.decisions}\n" \
-                       f"  事实: {m.important_facts}\n" \
-                       f"  偏好: {m.preferences}"
-                context_parts.append(part)
-                
-            return "\n".join(context_parts)
+            return "\n\n".join(context_parts)
             
         except Exception as e:
             print(f"[检索系统错误]: {e}")
