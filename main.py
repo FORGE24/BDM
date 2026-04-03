@@ -274,7 +274,7 @@ class DialogManager:
         if task_complete:
             print("[系统] 检测到话题结束/任务完成，主动触发记忆截断封装...")
             self._flush_current_chunk()
-            return
+            return reply
             
         # 4. 调用 Rust 层的智能分块算法
         chunks = bdm_rust.intelligent_chunking(self.current_stream, self.chunking_config)
@@ -299,6 +299,7 @@ class DialogManager:
             pass
             
         print(f"[系统] 已记录您的输入 (当前流积累 Token数估计: {bdm_rust.count_tokens(user_input)})")
+        return reply
         
     def _process_completed_chunk(self, chunk: MemoryChunk):
         """处理已经形成边界的完整记忆块"""
