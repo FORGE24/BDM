@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Boolean, Text, JSON, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from datetime import datetime
+from datetime import datetime, timezone
 from bdm_rust import MemoryChunk, DistilledMemory
 
 Base = declarative_base()
@@ -55,6 +55,9 @@ class DBDistilledMemory(Base):
     parent_nodes = Column(JSON, default=list)  # 前序节点 ID 列表
     child_nodes = Column(JSON, default=list)   # 后继节点 ID 列表
     
+    # 逻辑推演标记
+    is_inference = Column(Boolean, default=False)
+    
     # 热度衰减权重
     heat_score = Column(Float, default=1.0)    # 初始热度分数
     last_accessed = Column(DateTime, default=datetime.now)  # 最后访问时间
@@ -63,6 +66,16 @@ class DBDistilledMemory(Base):
     
     chunk = relationship("DBMemoryChunk", back_populates="distilled_memory")
 
+
+class DBConsolidatedBlock(Base):
+    __tablename__ = 'consolidated_blocks'
+
+    consolidation_id = Column(String, primary_key=True)
+    member_nodes = Column(JSON, default=list)  # 包含的原始节点 ID 列表
+    meta_semantic = Column(JSON, default=list) # 高维元语义向量
+    consolidation_score = Column(Float, default=1.0)
+    timestamp = Column(Integer, default=0)
+    collective_vitality = Column(Float, default=1.0) # Eros of Consolidation 集体生命值
 
 class DatabaseManager:
     def __init__(self, db_path="sqlite:///mled_memory.db"):
@@ -113,7 +126,8 @@ class DatabaseManager:
                     fidelity_score=dist.fidelity_score,
                     generation_cost=dist.generation_cost,
                     parent_nodes=getattr(dist, 'parent_nodes', []),
-                    heat_score=1.0,
+                    heat_score=getattr(dist, 'heat_score', 1.0),
+                    is_inference=getattr(dist, 'is_inference', False),
                     access_count=0
                 )
                 session.add(db_distilled)
@@ -139,10 +153,13 @@ class DatabaseManager:
                 
                 # 设置其他属性
                 chunk.chunk_id = db_chunk.chunk_id
-                chunk.timestamp = db_chunk.timestamp
+                
+                # 修复: 确保 timestamp 和 last_accessed 是带有时区信息的 datetime 对象
+                chunk.timestamp = db_chunk.timestamp.replace(tzinfo=timezone.utc) if db_chunk.timestamp and db_chunk.timestamp.tzinfo is None else db_chunk.timestamp
+                chunk.last_accessed = db_chunk.last_accessed.replace(tzinfo=timezone.utc) if db_chunk.last_accessed and db_chunk.last_accessed.tzinfo is None else db_chunk.last_accessed
+                
                 chunk.status = db_chunk.status
                 chunk.access_count = db_chunk.access_count
-                chunk.last_accessed = db_chunk.last_accessed
                 chunk.forgetting_rate = db_chunk.forgetting_rate
                 chunk.recovery_potential = db_chunk.recovery_potential
                 chunk.importance_score = db_chunk.importance_score
@@ -164,7 +181,10 @@ class DatabaseManager:
                         compression_ratio=db_dist.compression_ratio,
                         fidelity_score=db_dist.fidelity_score,
                         generation_cost=db_dist.generation_cost,
-                        embedding=db_dist.embedding
+                        embedding=db_dist.embedding,
+                        parent_nodes=db_dist.parent_nodes,
+                        heat_score=db_dist.heat_score,
+                        is_inference=db_dist.is_inference
                     )
                     dist.memory_id = db_dist.memory_id
                     chunk.distilled_version = dist
@@ -177,5 +197,43 @@ class DatabaseManager:
         except Exception as e:
             print(f"数据库加载失败: {e}")
             return []
+        finally:
+            session.close()
+
+    def get_all_nodes_with_embeddings(self):
+        """获取所有带有嵌入向量的蒸馏记忆节点，用于局部巩固"""
+        session = self.get_session()
+        try:
+            db_distilled = session.query(DBDistilledMemory).filter(DBDistilledMemory.embedding != None).all()
+            nodes = []
+            for dist in db_distilled:
+                if dist.embedding:
+                    nodes.append((dist.memory_id, dist.embedding))
+            return nodes
+        except Exception as e:
+            print(f"获取节点向量失败: {e}")
+            return []
+        finally:
+            session.close()
+            
+    def save_consolidated_block(self, block_info: dict):
+        """保存合并生成的巩固块"""
+        session = self.get_session()
+        try:
+            db_block = DBConsolidatedBlock(
+                consolidation_id=block_info["consolidation_id"],
+                member_nodes=block_info["member_nodes"],
+                meta_semantic=block_info.get("meta_semantic", []), # 确保 advanced_features.py 中传递了这个字段
+                consolidation_score=block_info.get("consolidation_score", 1.0),
+                timestamp=block_info.get("timestamp", 0),
+                collective_vitality=block_info.get("collective_vitality", 1.0)
+            )
+            session.add(db_block)
+            session.commit()
+            return True
+        except Exception as e:
+            print(f"保存巩固块失败: {e}")
+            session.rollback()
+            return False
         finally:
             session.close()

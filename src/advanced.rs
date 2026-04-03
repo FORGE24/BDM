@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 // 1. PREDICTIVE CODING & SPARSE IMPULSE
 // ============================================================================
 
-/// 神经元激活特征 - 记录内存访问的"稀疏脉冲"
+    /// 神经元激活特征 - 记录内存访问的"稀疏脉冲"
 #[pyclass(module = "bdm_rust")]
 #[derive(Clone, Debug)]
 pub struct NeuralSpike {
@@ -22,18 +22,21 @@ pub struct NeuralSpike {
     pub timestamp: i64,               // Unix 时间戳
     #[pyo3(get)]
     pub activation_type: String,      // "routine", "novel", "error"
+    #[pyo3(get)]
+    pub fiber_channel: String,        // 脑干光纤通道 (例如: "logic_pathway", "memory_bus")
 }
 
 #[pymethods]
 impl NeuralSpike {
     #[new]
-    #[pyo3(signature = (node_id, surprise_score, spike_magnitude=1.0, timestamp=0, activation_type="routine"))]
+    #[pyo3(signature = (node_id, surprise_score, spike_magnitude=1.0, timestamp=0, activation_type="routine", fiber_channel="default_bus"))]
     fn new(
         node_id: String,
         surprise_score: f64,
         spike_magnitude: f64,
         timestamp: i64,
         activation_type: &str,
+        fiber_channel: &str,
     ) -> Self {
         NeuralSpike {
             node_id,
@@ -41,6 +44,7 @@ impl NeuralSpike {
             spike_magnitude: spike_magnitude.clamp(0.0, 1.0),
             timestamp,
             activation_type: activation_type.to_string(),
+            fiber_channel: fiber_channel.to_string(),
         }
     }
     
@@ -81,9 +85,19 @@ pub struct SurpriseFilter {
     // 历史脉冲记录
     spike_history: VecDeque<NeuralSpike>,
     
+    // 生命值 (Vitality) 机制：用于触发恐惧脉冲
+    #[pyo3(get)]
+    pub vitality: f64,                // 0.0-1.0，随时间衰减
+    #[pyo3(get)]
+    pub vitality_decay_rate: f64,     // 生命值衰减率
+    #[pyo3(get)]
+    pub fear_threshold: f64,          // 触发恐惧脉冲的阈值
+    
     // 参数
     #[pyo3(get)]
     pub surprise_threshold: f64,      // 触发完整蒸馏的阈值
+    #[pyo3(get)]
+    pub base_surprise_threshold: f64, // 基础阈值，用于从恐惧脉冲中恢复
     #[pyo3(get)]
     pub decay_rate: f64,              // 预测衰减率
     #[pyo3(get)]
@@ -93,15 +107,44 @@ pub struct SurpriseFilter {
 #[pymethods]
 impl SurpriseFilter {
     #[new]
-    #[pyo3(signature = (surprise_threshold=0.4, decay_rate=0.95, window_size=100))]
-    fn new(surprise_threshold: f64, decay_rate: f64, window_size: usize) -> Self {
+    #[pyo3(signature = (surprise_threshold=0.4, decay_rate=0.95, window_size=100, vitality_decay_rate=0.05, fear_threshold=0.3))]
+    fn new(surprise_threshold: f64, decay_rate: f64, window_size: usize, vitality_decay_rate: f64, fear_threshold: f64) -> Self {
         SurpriseFilter {
             prediction_cache: HashMap::new(),
             running_surprise: 0.0,
             spike_history: VecDeque::new(),
+            vitality: 1.0,
+            vitality_decay_rate,
+            fear_threshold,
             surprise_threshold,
+            base_surprise_threshold: surprise_threshold,
             decay_rate,
             window_size,
+        }
+    }
+    
+    /// 执行生命周期：随时间衰减生命值，并检查是否触发恐惧脉冲
+    fn tick_vitality(&mut self) -> bool {
+        self.vitality -= self.vitality_decay_rate;
+        if self.vitality < 0.0 {
+            self.vitality = 0.0;
+        }
+        
+        // 恐惧脉冲：如果生命值过低，极度调高敏感度（降低惊奇度阈值）
+        if self.vitality < self.fear_threshold {
+            self.surprise_threshold = self.base_surprise_threshold * 0.2; // 极其敏感，什么都大惊小怪
+            true // 触发了恐惧脉冲
+        } else {
+            self.surprise_threshold = self.base_surprise_threshold;
+            false
+        }
+    }
+    
+    /// 喂食系统：当系统获得有价值的信息（降低了熵增）时，恢复生命值
+    fn feed_vitality(&mut self, amount: f64) {
+        self.vitality += amount;
+        if self.vitality > 1.0 {
+            self.vitality = 1.0;
         }
     }
     
@@ -138,8 +181,10 @@ impl SurpriseFilter {
 
         let distance = sum_sq.sqrt();
         
-        // 用 sigmoid 映射到 (0, 1)
-        1.0 / (1.0 + (-distance + 2.0).exp())
+        // 用更平缓的函数映射到 (0, 1) 范围，使区分度更高
+        // 降低灵敏度，使得大部分普通对话的误差不会过高
+        let scale_factor = 2.0;
+        1.0 - (-distance / scale_factor).exp()
     }
 
     /// 评估脉冲：是否超过阈值？
@@ -147,8 +192,17 @@ impl SurpriseFilter {
         surprise_score >= self.surprise_threshold
     }
 
-    /// 记录脉冲事件
-    fn record_spike(&mut self, spike: NeuralSpike) {
+    /// 记录脉冲事件，并在脑干光纤中传播
+    fn record_spike(&mut self, mut spike: NeuralSpike) {
+        // 根据惊奇度自动分配脑干光纤通道
+        if spike.surprise_score > 0.8 {
+            spike.fiber_channel = "brainstem_emergency_fiber".to_string(); // 极高惊奇，紧急中断
+        } else if spike.surprise_score > self.surprise_threshold {
+            spike.fiber_channel = "cortex_routing_fiber".to_string(); // 高惊奇，皮层路由
+        } else {
+            spike.fiber_channel = "autonomic_cache_fiber".to_string(); // 低惊奇，自主神经缓存
+        }
+        
         self.spike_history.push_back(spike.clone());
         
         // 维持窗口大小
@@ -227,18 +281,21 @@ pub struct ConsolidatedBlock {
     pub consolidation_score: f64,     // 巩固质量 (0.0-1.0)
     #[pyo3(get)]
     pub timestamp: i64,
+    #[pyo3(get)]
+    pub collective_vitality: f64,     // 集体生命值 (Eros of Consolidation)
 }
 
 #[pymethods]
 impl ConsolidatedBlock {
     #[new]
-    fn new(consolidation_id: String, member_nodes: Vec<String>, meta_semantic: Vec<f64>) -> Self {
+    fn new(consolidation_id: String, member_nodes: Vec<String>, meta_semantic: Vec<f64>, collective_vitality: f64) -> Self {
         ConsolidatedBlock {
             consolidation_id,
             member_nodes,
             meta_semantic,
             consolidation_score: 1.0,
             timestamp: 0,
+            collective_vitality,
         }
     }
     
@@ -330,11 +387,13 @@ impl LocalConsolidationEngine {
         clusters
     }
 
-    /// 生成巩固块 - 合并碎片的元语义
+    /// 生成巩固块 - 合并碎片的元语义，并保留因果链条 (DAG)
+    /// 引入 "Eros of Consolidation" - 合并即生存，集体提高 Vitality
     fn consolidate_cluster(
         &mut self,
         cluster: Vec<String>,
         embeddings: Vec<Vec<f64>>,
+        base_vitality: f64, // 传入当前的平均生命值
     ) -> ConsolidatedBlock {
         // 计算元语义向量（平均 + 方差）
         let mut meta_semantic = vec![0.0; embeddings[0].len()];
@@ -351,7 +410,15 @@ impl LocalConsolidationEngine {
         }
 
         let consolidation_id = format!("consolidated_{}", uuid::Uuid::new_v4());
-        let block = ConsolidatedBlock::new(consolidation_id.clone(), cluster, meta_semantic);
+        
+        // Eros of Consolidation: 碎片合并后，生命值获得非线性提升，对抗死亡
+        // 比如 3 个碎片合并，生命值不是简单的平均，而是有额外奖励
+        let cluster_size = cluster.len() as f64;
+        let collective_vitality = (base_vitality * (1.0 + (cluster_size * 0.1))).clamp(0.0, 1.0);
+        
+        // 这里的 cluster 包含了所有的原节点 ID
+        // ConsolidatedBlock 会记录下这些成员节点，从而在 Python 层重建或者保留 DAG 的因果关系
+        let block = ConsolidatedBlock::new(consolidation_id.clone(), cluster, meta_semantic, collective_vitality);
         
         self.consolidation_history.push(block.clone());
         block
@@ -456,47 +523,73 @@ impl MoERouter {
     ) -> Vec<(String, f64)> {
         let mut logits = vec![0.0; self.experts.len()];
 
-        // 基于 DAG 路径计算亲和力
+        // 基于 DAG 路径和节点内容计算亲和力
         for (i, expert) in self.experts.iter().enumerate() {
             let affinity = match expert.expert_type.as_str() {
                 "math" => {
-                    // 数学专家：路径长度的函数
-                    (dag_context.len() as f64 / 10.0).min(1.0)
+                    // 数学专家：仅对明显的数学计算请求敏感，避免误伤带有数字的故事设定
+                    if current_node_id.contains("计算") || current_node_id.contains("等于") || 
+                       current_node_id.contains("多少") || current_node_id.contains("算一下") {
+                        if current_node_id.contains("=") || current_node_id.contains("+") || 
+                           current_node_id.contains("-") || current_node_id.contains("*") || 
+                           current_node_id.contains("/") || current_node_id.contains("^") ||
+                           current_node_id.chars().any(|c| c.is_digit(10)) {
+                            0.9
+                        } else {
+                            0.3
+                        }
+                    } else {
+                        0.1
+                    }
                 }
                 "physics" => {
-                    // 物理专家：关键词匹配
-                    if current_node_id.contains("motion") || current_node_id.contains("force") {
-                        1.0
+                    // 物理专家：对物理名词敏感
+                    if current_node_id.contains("光速") || current_node_id.contains("速度") || 
+                       current_node_id.contains("时间") || current_node_id.contains("空间") ||
+                       current_node_id.contains("引力") || current_node_id.contains("质量") {
+                        0.9
                     } else {
-                        0.2
+                        0.1
                     }
                 }
                 "logic" => {
-                    // 逻辑专家：通用激活
-                    0.8
+                    // 逻辑专家：对推理词汇敏感
+                    if current_node_id.contains("为什么") || current_node_id.contains("原因") || 
+                       current_node_id.contains("假设") || current_node_id.contains("如果") ||
+                       current_node_id.contains("逻辑") || current_node_id.contains("分析") {
+                        0.8
+                    } else {
+                        0.4 // 默认的基础兜底专家
+                    }
                 }
                 "memory" => {
-                    // 记忆专家：高访问频率激活
-                    (dag_context.len() as f64 / 5.0).min(1.0)
+                    // 记忆专家：对历史查询词汇敏感
+                    if current_node_id.contains("之前") || current_node_id.contains("记得") || 
+                       current_node_id.contains("刚才") || current_node_id.contains("回顾") ||
+                       current_node_id.contains("历史") || current_node_id.contains("设定") {
+                        0.95
+                    } else if !dag_context.is_empty() {
+                        0.6 // 有上下文时也倾向于激活记忆专家
+                    } else {
+                        0.1
+                    }
                 }
                 _ => 0.1,
             };
 
-            logits[i] = affinity * expert.weight;
+            // 引入一定的随机性（温度），防止永远固定路由到同一个专家
+            let temp = expert.activation_temperature.max(0.1);
+            logits[i] = (affinity * expert.weight) / temp;
         }
 
         // Softmax 归一化
-        let sum: f64 = logits.iter().map(|x| x.exp()).sum();
-        let probabilities: Vec<f64> = logits
-            .iter()
-            .map(|x| x.exp() / sum)
-            .collect();
-
-        // 返回排序的 (expert_id, probability)
+        let max_logit = logits.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let sum: f64 = logits.iter().map(|x| (*x - max_logit).exp()).sum();
+        
         let mut result: Vec<_> = self.experts
             .iter()
-            .zip(probabilities.iter())
-            .map(|(exp, prob)| (exp.expert_id.clone(), *prob))
+            .zip(logits.iter())
+            .map(|(exp, logit)| (exp.expert_id.clone(), (*logit - max_logit).exp() / sum))
             .collect();
 
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -529,17 +622,90 @@ pub struct WorldModelExecutor {
     pub router: MoERouter,
     pub execution_log: Vec<(String, String, f64)>, // (node_id, expert_id, timestamp)
     pub world_state: HashMap<String, f64>,         // 世界状态变量
+    
+    // 自然选择与微突变 (Micro-Mutation & Selection)
+    pub branch_fitness: HashMap<String, f64>,      // 专家分支 -> 适应度 (0.0 - 1.0)
+    pub token_allocation: HashMap<String, usize>,  // 专家分支 -> 分配的 Token 空间
 }
 
 #[pymethods]
 impl WorldModelExecutor {
     #[new]
     fn new() -> Self {
-        WorldModelExecutor {
+        let mut executor = WorldModelExecutor {
             router: MoERouter::new(),
             execution_log: Vec::new(),
             world_state: HashMap::new(),
+            branch_fitness: HashMap::new(),
+            token_allocation: HashMap::new(),
+        };
+        
+        // 初始化每个分支的 Token 空间
+        executor.token_allocation.insert("math".to_string(), 256);
+        executor.token_allocation.insert("physics".to_string(), 256);
+        executor.token_allocation.insert("logic".to_string(), 256);
+        executor.token_allocation.insert("memory".to_string(), 256);
+        
+        // 初始化适应度
+        executor.branch_fitness.insert("math".to_string(), 0.5);
+        executor.branch_fitness.insert("physics".to_string(), 0.5);
+        executor.branch_fitness.insert("logic".to_string(), 0.5);
+        executor.branch_fitness.insert("memory".to_string(), 0.5);
+        
+        executor
+    }
+    
+    /// 评估分支适应度，如果分支表现不佳（未能缓解恐惧脉冲），则进行微小惩罚。
+    /// 极低适应度的分支将被直接剪枝（Token 空间释放给其他分支）
+    fn evaluate_and_select(&mut self, fear_resolved: bool, active_expert_type: String) -> Vec<String> {
+        let mut pruned_branches = Vec::new();
+        
+        if let Some(fitness) = self.branch_fitness.get_mut(&active_expert_type) {
+            if fear_resolved {
+                *fitness = (*fitness + 0.05).clamp(0.0, 1.0); // 奖励：缓解了恐惧
+            } else {
+                *fitness = (*fitness - 0.05).clamp(0.0, 1.0); // 惩罚：未缓解恐惧
+            }
+            
+            // 死亡判定 (Pruning)
+            if *fitness <= 0.1 {
+                pruned_branches.push(active_expert_type.clone());
+            }
         }
+        
+        // 优胜劣汰：释放死亡分支的 Token 空间，按比例分配给幸存者
+        for pruned in &pruned_branches {
+            if let Some(freed_tokens) = self.token_allocation.remove(pruned) {
+                // 将被剪枝的分支适应度设为 0 (逻辑死亡)
+                self.branch_fitness.insert(pruned.clone(), 0.0);
+                
+                // 将释放的 Token 平均分配给适应度最高的分支
+                let mut best_branch = "".to_string();
+                let mut max_fit = 0.0;
+                for (branch, fit) in &self.branch_fitness {
+                    if *fit > max_fit {
+                        max_fit = *fit;
+                        best_branch = branch.clone();
+                    }
+                }
+                
+                if !best_branch.is_empty() {
+                    if let Some(alloc) = self.token_allocation.get_mut(&best_branch) {
+                        *alloc += freed_tokens;
+                    }
+                }
+            }
+        }
+        
+        // 微突变：对所有存活分支的权重进行 +/- 0.001 级别的微调
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for expert in &mut self.router.experts {
+            let mutation = rng.gen_range(-0.001..=0.001);
+            expert.weight = (expert.weight + mutation).clamp(0.0, 1.0);
+        }
+        
+        pruned_branches
     }
 
     /// 模拟一步世界更新

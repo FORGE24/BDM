@@ -51,7 +51,7 @@ class MemoryRetriever:
             return 0.0
         return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
     
-    def retrieve_context(self, query: str, limit: int = 3, max_tokens: int = 512) -> str:
+    def retrieve_context(self, query: str, limit: int = 3, max_tokens: int = 512, return_nodes: bool = False):
         """
         【升级】拓扑启发式检索：
         1. 向量相似度定位目标节点
@@ -75,7 +75,7 @@ class MemoryRetriever:
             scored_memories.sort(key=lambda x: x[0], reverse=True)
             
             if not scored_memories:
-                return "（无相关历史记忆）"
+                return [] if return_nodes else "（无相关历史记忆）"
             
             # 取最相关的节点作为起点
             top_memory = scored_memories[0][1]
@@ -87,12 +87,15 @@ class MemoryRetriever:
             # Step 3: 构建上下文 - Token 分配和协议化符号
             context_parts = []
             total_tokens = 0
+            retrieved_nodes = []
             
             for node_id, depth, distance, token_allocation in retrieval_chain:
                 # 查询该节点的详细内容
                 node_memory = session.query(DBDistilledMemory).filter_by(memory_id=node_id).first()
                 if not node_memory:
                     continue
+                
+                retrieved_nodes.append(node_memory.chunk)
                 
                 # 获取符号协议链
                 context_chain = self.dag.get_context_chain(node_id)
@@ -123,6 +126,9 @@ class MemoryRetriever:
                 if total_tokens >= max_tokens:
                     break
             
+            if return_nodes:
+                return retrieved_nodes
+            
             if not context_parts:
                 return "（无相关历史记忆）"
                 
@@ -130,6 +136,6 @@ class MemoryRetriever:
             
         except Exception as e:
             print(f"[检索系统错误]: {e}")
-            return "（检索失败）"
+            return [] if return_nodes else "（检索失败）"
         finally:
             session.close()

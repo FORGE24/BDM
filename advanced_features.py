@@ -37,10 +37,23 @@ class PredictiveCodecInterface:
         self.filter = SurpriseFilter(
             surprise_threshold=surprise_threshold,
             decay_rate=0.95,
-            window_size=100
+            window_size=100,
+            vitality_decay_rate=0.05,
+            fear_threshold=0.3
         )
         self.spike_buffer = []
         self.prediction_cache = {}
+        
+    def tick(self) -> bool:
+        """
+        执行一个时间步，衰减生命值
+        Returns: 是否触发了恐惧脉冲
+        """
+        return self.filter.tick_vitality()
+        
+    def feed_vitality(self, amount: float):
+        """喂食生命值（当对话成功降低熵增时调用）"""
+        self.filter.feed_vitality(amount)
         
     def compute_surprise(
         self,
@@ -72,13 +85,21 @@ class PredictiveCodecInterface:
         # 判断是否应该触发脉冲
         should_fire = self.filter.should_fire_spike(surprise_score)
         
+        # 根据惊奇度分配光纤通道（模拟物理脉冲）
+        fiber_channel = "autonomic_cache_fiber"
+        if surprise_score > 0.8:
+            fiber_channel = "brainstem_emergency_fiber"
+        elif should_fire:
+            fiber_channel = "cortex_routing_fiber"
+            
         # 记录脉冲
         spike = NeuralSpike(
             node_id=node_id,
             surprise_score=surprise_score,
             spike_magnitude=surprise_score,
             timestamp=int(datetime.now().timestamp()),
-            activation_type="novel" if surprise_score > 0.7 else "routine"
+            activation_type="novel" if surprise_score > 0.7 else "routine",
+            fiber_channel=fiber_channel
         )
         self.filter.record_spike(spike)
         self.spike_buffer.append(spike)
@@ -93,6 +114,7 @@ class PredictiveCodecInterface:
             "spike_count": spike_count,
             "max_surprise": max_surprise,
             "threshold": self.filter.surprise_threshold,
+            "vitality": self.filter.vitality, # 新增生命值监控
             "buffer_size": len(self.spike_buffer)
         }
     
@@ -172,20 +194,14 @@ class MemoryConsolidationEngine:
     def consolidate(
         self,
         cluster: List[str],
-        embeddings: List[List[float]]
+        embeddings: List[List[float]],
+        base_vitality: float = 1.0 # 引入 Eros of Consolidation
     ) -> Dict:
         """
         执行单个碎片组的巩固
-        
-        Args:
-            cluster: 节点ID列表
-            embeddings: 对应的嵌入向量
-            
-        Returns:
-            巩固块信息
         """
         consolidated_block = self.consolidator.consolidate_cluster(
-            cluster, embeddings
+            cluster, embeddings, base_vitality
         )
         
         block_info = {
@@ -193,7 +209,9 @@ class MemoryConsolidationEngine:
             "member_nodes": consolidated_block.member_nodes,
             "consolidation_score": consolidated_block.consolidation_score,
             "timestamp": consolidated_block.timestamp,
-            "meta_semantic_dimension": len(consolidated_block.meta_semantic)
+            "meta_semantic_dimension": len(consolidated_block.meta_semantic),
+            "meta_semantic": consolidated_block.meta_semantic,
+            "collective_vitality": consolidated_block.collective_vitality # 新增
         }
         
         self.consolidation_log.append(block_info)

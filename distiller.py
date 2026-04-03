@@ -1,9 +1,13 @@
 import os
 import json
+import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from memory import MemoryChunk, DistilledMemory
 from sentence_transformers import SentenceTransformer
+
+# 抑制 SentenceTransformer 加载权重的警告
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 load_dotenv()
 
@@ -33,146 +37,169 @@ def call_llm(prompt: str, model: str = "deepseek-chat", response_format: dict = 
     )
     return response.choices[0].message.content
 
-def self_validate_summary(summary_json: dict, raw_text: str) -> tuple[bool, str]:
-    """自我校验蒸馏出的摘要是否准确反映了原始对话"""
-    prompt = f"""
-    请评估以下由AI生成的结构化摘要是否准确、完整地反映了原始对话的核心内容。
+def self_validate_summary(summary_json: dict, raw_text: str, parent_contexts: str = "") -> tuple[bool, str]:
+    """自我校验蒸馏出的摘要是否准确反映了原始对话或继承自父节点"""
     
-    [原始对话]：
+    inherited_prompt = ""
+    if parent_contexts:
+        inherited_prompt = f"""
+        [父节点继承上下文 (Inherited Context)]：
+        如果在摘要中出现了[原始对话]中没有，但存在于以下[父节点继承上下文]中的内容，
+        这是【合法的上下文继承】，**绝对不要**将其判定为幻觉。
+        
+        {parent_contexts}
+        """
+
+    prompt = f"""
+    请评估以下由AI生成的结构化摘要是否准确、完整地反映了对话的核心内容。
+    
+    [当前块原始对话]：
     {raw_text}
+    
+    {inherited_prompt}
     
     [生成的结构化摘要]：
     {json.dumps(summary_json, ensure_ascii=False, indent=2)}
     
     你需要判断：
-    1. 是否存在严重的“幻觉”（无中生有）？
+    1. 是否存在严重的"幻觉"（无中生有，添加了【既不在当前块对话中，也不在父节点上下文中，且无法被合理推导】的实体、决策、事实等）？
     2. 是否遗漏了非常关键的决策或实体？
+    3. 摘要中的所有内容是否都能在【当前块对话】或【父节点上下文】中找到依据，或者是由 AI 合理推导出的内容（Inference）？
+    
+    【严格要求】：
+    - 摘要中提取的实体、决策和事实等，必须来源于用户的对话内容或故事设定。
+    - **逻辑推论例外**：如果 `is_inference` 为 true，或者内容位于 `inferences` 字段中，这是 AI 的逻辑推演，属于合法内容，**不算作幻觉**。
+    - **系统状态的快照**（如激活了哪个专家、系统处于什么模式）是 Memory DAG 的一部分，这些属于【状态元数据 (Metadata)】。
+    - 如果摘要的 `metadata` 字段中包含了“MLED”、“DeepSeek”、“记忆挖掘专家已激活”等系统状态词汇，这是**合法**的，不算作幻觉。
+    - 但如果把系统状态词汇错误地放入了 `entities`（实体）或 `important_facts`（事实）中，则判定为幻觉。
+    - 允许继承父节点上下文中的信息，这不算幻觉。
     
     请严格按照以下JSON格式输出评估结果：
     {{
         "passed": true或false,
-        "reason": "通过或不通过的原因"
+        "reason": "通过或不通过的原因，详细说明哪些内容是真正的幻觉"
     }}
     """
     
     try:
-        eval_str = call_llm(prompt, system_msg="你是一个无情的质量检查员，专门检查内容摘要的准确性。")
+        eval_str = call_llm(prompt, system_msg="你是一个理性的质量检查员。你懂得区分什么是'上下文继承'，什么是'无中生有的幻觉'。")
         eval_json = json.loads(eval_str)
         return eval_json.get("passed", True), eval_json.get("reason", "未提供原因")
     except Exception as e:
         print(f"[自校验错误] {e}")
         return True, "校验过程出错，默认放行"
 
-def lower_compression(current_level: str) -> str:
-    """降级压缩要求，保留更多细节"""
-    if current_level == "high":
-        return "balanced"
-    elif current_level == "balanced":
-        return "low"
-    return "low"
-
-def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = None, compression_level: str = "balanced", max_retries: int = 1, all_memory_ids: list = None) -> DistilledMemory:
+def self_distillation(chunk: MemoryChunk, all_memory_ids: list = None, parent_contexts: str = "") -> DistilledMemory:
     """
     结构化自蒸馏：从原始对话块提取结构化摘要 + 因果链接。
-    如果提供了 previous_distilled，则将其纳入上下文，使新记忆继承上一轮的50%精华。
+    引入血统因子 (parent_contexts)，允许上下文合法继承。
     """
     if all_memory_ids is None:
         all_memory_ids = []
+        
+    available_refs = json.dumps(all_memory_ids[-10:]) if all_memory_ids else "[]"
     
-    compression_prompts = {
-        "high": "生成极简摘要(50-100 tokens)，只保留核心决策",
-        "balanced": "生成标准摘要(100-200 tokens)，保留关键信息",
-        "low": "生成详细摘要(200-500 tokens)，保留多数细节"
-    }
-    
-    prev_context = ""
-    if previous_distilled:
-        prev_context = f"""
-    [上一轮对话的高浓缩记忆块] (请将以下重要信息以 50% 的压缩率融入到本次新蒸馏结果中，保持记忆的连贯性):
-    - 实体: {previous_distilled.entities}
-    - 决策: {previous_distilled.decisions}
-    - 事实: {previous_distilled.important_facts}
-    - 偏好: {previous_distilled.preferences}
+    inherited_prompt = ""
+    if parent_contexts:
+        inherited_prompt = f"""
+        [你可以继承的父节点上下文]：
+        {parent_contexts}
+        注意：你可以将父节点上下文中的关键实体/事实与当前对话结合起来提取。
         """
-    
-    # 构建可用的 memory_id 列表作为参考
-    available_refs = json.dumps(all_memory_ids[-10:]) if all_memory_ids else "[]"  # 只包含最近10个
+        
+    system_msg = """
+    你是一个极其理性的信息提取引擎。
+    【最高指令】：
+    1. 你的任务是从[原始对话]中提取信息。如果存在[父节点上下文]，你可以将其与当前对话结合理解。
+    2. 区分【用户故事内容】、【系统运行状态】和【逻辑推演】。
+       - 将故事实体放在 `entities` 中。
+       - 将系统运行状态（如：激活了某个专家、MLED系统状态）提取到 `metadata` 中。
+       - **极其重要**：如果是AI（特别是逻辑推理专家）基于事实做出的**逻辑推断、假设或补充设定**，请将其放入 `inferences` 字段，并在根级别设置 `"is_inference": true`。
+    3. 提取的信息必须能够追溯到当前对话或父节点上下文中，或者是基于这些上下文的合理推演。
+    """
     
     prompt = f"""
-    请对以下对话进行结构化摘要并识别因果依赖关系：
-    {prev_context}
+    请对以下【唯一的原始对话片段】进行结构化提取：
     
-    [本次原始对话]：
+    [原始对话片段开始]
     {chunk.raw_text}
+    [原始对话片段结束]
     
-    【重要】：识别因果链接 - 这个记忆块依赖于哪些前序节点？
+    {inherited_prompt}
+    
     可用的前序记忆块 ID: {available_refs}
-    如果本记忆与之前的记忆有因果关系，请选择最多 3 个父节点。
+    如果本记忆与之前的记忆有【明确的逻辑或因果依赖】，请选择最多 3 个父节点ID。如果没有，留空。
     
     请严格按照以下JSON格式输出（必须返回JSON格式）：
     {{
-        "entities": ["实体1", "实体2", ...],
-        "decisions": ["决策1", "决策2", ...],
-        "actions": ["行动1", "行动2", ...],
-        "preferences": ["偏好1", "偏好2", ...],
-        "code_snippets": ["代码片段1", "代码片段2", ...],
-        "important_facts": ["事实1", "事实2", ...],
-        "constraints": ["约束1", "约束2", ...],
-        "parent_nodes": ["前序记忆块ID1", "前序记忆块ID2"]  【新增】：因果链接
+        "entities": ["实体1", ...],
+        "decisions": ["决策1", ...],
+        "actions": ["行动1", ...],
+        "preferences": ["偏好1", ...],
+        "important_facts": ["事实1", ...],
+        "inferences": ["推论1", "推论2", ...],
+        "metadata": ["系统状态快照1", "使用的专家模块", ...],
+        "parent_nodes": ["前序记忆块ID1", ...],
+        "is_inference": true 或 false
     }}
-    
-    要求：{compression_prompts.get(compression_level, compression_prompts["balanced"])}
     """
     
-    try:
-        summary_str = call_llm(prompt)
-        structured_summary = json.loads(summary_str)
-        
-        # 增加自我校验环节 (Self-Validation)
-        fidelity_score = 1.0
-        is_valid, reason = self_validate_summary(structured_summary, chunk.raw_text)
-        if not is_valid:
-            print(f"[蒸馏自校验失败] 原因: {reason}")
-            if max_retries > 0:
-                new_level = lower_compression(compression_level)
-                print(f"[蒸馏自校验] 尝试降低压缩率({new_level})并重试...")
-                # 惩罚一次重试带来的保真度降低
-                retried_distilled = self_distillation(chunk, previous_distilled, new_level, max_retries - 1, all_memory_ids)
-                retried_distilled.fidelity_score = 0.8
-                return retried_distilled
+    max_retries = 2
+    is_valid = False
+    structured_summary = {}
+    
+    for attempt in range(max_retries + 1):
+        try:
+            summary_str = call_llm(prompt, system_msg=system_msg)
+            structured_summary = json.loads(summary_str)
+            
+            is_valid, reason = self_validate_summary(structured_summary, chunk.raw_text, parent_contexts)
+            if is_valid:
+                break
+                
+            print(f"[蒸馏自校验拦截] 第 {attempt + 1} 次尝试失败: {reason}")
+            if attempt == max_retries:
+                print("[蒸馏自校验] 重试耗尽，启动【模糊保存模式】 (Fuzzy Save Mode)")
+                structured_summary["_uncertainty_flag"] = True
+                structured_summary["_validation_failure_reason"] = reason
             else:
-                print("[蒸馏自校验] 重试次数耗尽，强行保存当前不完美结果。")
-                fidelity_score = 0.5
-        
-        # 生成向量嵌入 (Vector Embedding)
-        embedding_text = f"实体: {' '.join(structured_summary.get('entities', []))} | 决策: {' '.join(structured_summary.get('decisions', []))} | 事实: {' '.join(structured_summary.get('important_facts', []))}"
+                prompt += f"\n\n[上一次提取失败原因]：{reason}\n请严格修正，去除真正的幻觉，但保留合法的继承上下文！"
+                
+        except Exception as e:
+            print(f"自蒸馏解析失败: {e}")
+            structured_summary = {
+                "entities": [], "decisions": [], "actions": [], 
+                "preferences": [], "important_facts": [], "parent_nodes": [],
+                "_uncertainty_flag": True, "_error": str(e)
+            }
+            break
+            
+    # 生成向量嵌入 (Vector Embedding)
+    # 将推论 inferences 也加入到向量化文本中
+    embedding_text = f"实体: {' '.join(structured_summary.get('entities', []))} | 决策: {' '.join(structured_summary.get('decisions', []))} | 事实: {' '.join(structured_summary.get('important_facts', []))} | 推论: {' '.join(structured_summary.get('inferences', []))}"
+    # 如果全为空，则不生成无意义的向量
+    if len(embedding_text) < 20:
+        embedding_vector = []
+    else:
         embedding_vector = embedding_model.encode(embedding_text).tolist()
-        
-        # 构建 DistilledMemory
-        distilled = DistilledMemory(
-            source_chunk_id=chunk.chunk_id,
-            structured_summary=structured_summary,
-            entities=structured_summary.get("entities", []),
-            decisions=structured_summary.get("decisions", []),
-            actions=structured_summary.get("actions", []),
-            preferences=structured_summary.get("preferences", []),
-            code_snippets=structured_summary.get("code_snippets", []),
-            important_facts=structured_summary.get("important_facts", []),
-            constraints=structured_summary.get("constraints", []),
-            compression_ratio=0.5 if compression_level == "high" else (0.3 if compression_level=="balanced" else 0.1),
-            fidelity_score=fidelity_score,
-            generation_cost=0,
-            embedding=embedding_vector,
-            parent_nodes=structured_summary.get("parent_nodes", []),  # 【新增】：从 LLM 输出解析
-            heat_score=1.0  # 初始热度分数
-        )
-        
-        return distilled
-    except Exception as e:
-        print(f"自蒸馏失败: {e}")
-        # 降级或返回空
-        return DistilledMemory(
-            source_chunk_id=chunk.chunk_id,
-            structured_summary={"error": str(e)},
-            embedding=[]
-        )
+    
+    distilled = DistilledMemory(
+        source_chunk_id=chunk.chunk_id,
+        structured_summary=structured_summary,
+        entities=structured_summary.get("entities", []),
+        decisions=structured_summary.get("decisions", []),
+        actions=structured_summary.get("actions", []),
+        preferences=structured_summary.get("preferences", []),
+        code_snippets=[],
+        important_facts=structured_summary.get("important_facts", []) + structured_summary.get("inferences", []), # 推论也作为事实存储，以便后续检索
+        constraints=[],
+        compression_ratio=0.3,
+        fidelity_score=1.0 if is_valid else 0.1,
+        generation_cost=0,
+        embedding=embedding_vector,
+        parent_nodes=structured_summary.get("parent_nodes", []),
+        heat_score=1.0,
+        is_inference=structured_summary.get("is_inference", False)
+    )
+    
+    return distilled

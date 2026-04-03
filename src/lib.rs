@@ -31,12 +31,15 @@ pub struct DistilledMemory {
     
     // 热度衰减权重
     pub heat_score: f64,
+    
+    // 逻辑推演标记：标志这段记忆是用户直接给出的事实，还是 MoE 专家(特别是逻辑专家)在预测编码期间推导出的结论
+    pub is_inference: bool,
 }
 
 #[pymethods]
 impl DistilledMemory {
     #[new]
-    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None, parent_nodes=None, heat_score=1.0))]
+    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None, parent_nodes=None, heat_score=1.0, is_inference=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         source_chunk_id: String,
@@ -54,6 +57,7 @@ impl DistilledMemory {
         embedding: Option<Vec<f64>>,
         parent_nodes: Option<Vec<String>>,
         heat_score: f64,
+        is_inference: bool,
     ) -> Self {
         DistilledMemory {
             memory_id: Uuid::new_v4().to_string(),
@@ -72,6 +76,7 @@ impl DistilledMemory {
             embedding: embedding.unwrap_or_default(),
             parent_nodes: parent_nodes.unwrap_or_default(),
             heat_score,
+            is_inference,
         }
     }
 }

@@ -1,14 +1,17 @@
 import os
 import time
+import asyncio
+import threading
 from dotenv import load_dotenv
 import bdm_rust
 from memory import MemoryChunk
-from distiller import self_distillation, call_llm
+from distiller import self_distillation, call_llm, embedding_model
 from database import DatabaseManager
 from evolution import EvolutionaryOptimizer
 from safety import SafetyGuardrail
 from retriever import MemoryRetriever
 from intent import check_task_completion
+from advanced_features import PredictiveCodecInterface, MemoryConsolidationEngine, ExpertWorldModel, AdvancedBDMSystem
 
 load_dotenv()
 
@@ -16,6 +19,16 @@ class DialogManager:
     def __init__(self, max_tokens=1000):
         self.evolution_engine = EvolutionaryOptimizer()
         self.safety_guardrail = SafetyGuardrail()
+        
+        # Phase 3: 初始化高级功能
+        self.predictive_codec = PredictiveCodecInterface(surprise_threshold=0.3) # 进一步调低阈值，让其更容易跳出缓存，增加活泼度
+        self.consolidation_engine = MemoryConsolidationEngine()
+        self.world_model = ExpertWorldModel()
+        
+        # 缓存上一轮预测，用于惊奇度计算
+        self.last_expected_embedding = None
+        self.consecutive_cache_hits = 0  # 记录连续缓存命中的次数
+        self.fear_pulse_active = False   # 记录当前是否处于恐惧脉冲状态
         
         # 从进化引擎获取初始参数
         params = self.evolution_engine.current_params
@@ -45,8 +58,56 @@ class DialogManager:
             "fidelity_scores": []
         }
         
-    def generate_response(self, user_input: str) -> str:
-        """生成大模型响应，结合相关历史记忆"""
+        # 启动后台巩固线程
+        self.consolidation_thread = threading.Thread(target=self._start_background_consolidation, daemon=True)
+        self.consolidation_thread.start()
+        
+    def _start_background_consolidation(self):
+        """在后台运行巩固任务的包装方法"""
+        asyncio.run(self._run_consolidation_loop())
+        
+    async def _run_consolidation_loop(self):
+        """后台异步运行巩固任务（模拟睡眠）"""
+        interval_seconds = 60 # 可以配置
+        print(f"[系统后台] 记忆巩固引擎已启动，周期为 {interval_seconds} 秒")
+        while True:
+            try:
+                # 只在有一定量新记忆时才执行巩固
+                if len(self.current_stream) > 0 or self.session_metrics["total_turns"] < 3:
+                    await asyncio.sleep(interval_seconds)
+                    continue
+                    
+                # 从数据库获取所有节点
+                nodes = self.db_manager.get_all_nodes_with_embeddings()
+                
+                # 需要至少有多个节点才值得合并
+                if nodes and len(nodes) >= 3:
+                    # 识别碎片
+                    clusters = self.consolidation_engine.identify_fragments(nodes)
+                    
+                    # 过滤掉单节点集群
+                    valid_clusters = [c for c in clusters if len(c) > 1]
+                    
+                    if valid_clusters:
+                        print(f"\n[系统后台] 触发局部巩固: 发现 {len(valid_clusters)} 个语义碎片组，开始合并...")
+                        
+                        # 执行巩固
+                        for cluster in valid_clusters:
+                            embeddings = [n[1] for n in nodes if n[0] in cluster]
+                            block_info = self.consolidation_engine.consolidate(cluster, embeddings)
+                            
+                            # 保存到数据库
+                            if self.db_manager.save_consolidated_block(block_info):
+                                print(f"  -> [巩固完成] 合并 {len(cluster)} 个节点 -> Super Node [{block_info['consolidation_id'][:8]}]")
+                
+                await asyncio.sleep(interval_seconds)
+                
+            except Exception as e:
+                print(f"巩固任务错误: {e}")
+                await asyncio.sleep(interval_seconds)
+        
+    def generate_response(self, user_input: str, active_expert: str = None) -> str:
+        """生成大模型响应，结合相关历史记忆和路由的专家系统提示"""
         
         # 1. 检索历史记忆
         context = self.retriever.retrieve_context(user_input)
@@ -61,6 +122,18 @@ class DialogManager:
 - 事实与信息: {self.last_distilled_memory.important_facts}
             """
 
+        # 3. Phase 3: MoE 专家路由映射到 LLM System Prompt
+        expert_prompt = ""
+        if active_expert:
+            if "logic" in active_expert:
+                expert_prompt = "\n【当前激活专家：逻辑推理专家】请你对用户的问题进行严谨的逻辑分析，分步骤推导结论，指出其中的假设和潜在的矛盾。"
+            elif "math" in active_expert:
+                expert_prompt = "\n【当前激活专家：数学计算专家】请你关注问题中的数值和计算逻辑，确保数学推导的绝对准确性。"
+            elif "physics" in active_expert:
+                expert_prompt = "\n【当前激活专家：物理科学专家】请你运用物理定律和科学原理来解释用户的问题，注重因果关系和客观规律。"
+            elif "memory" in active_expert:
+                expert_prompt = "\n【当前激活专家：记忆挖掘专家】请你深度依赖提供的【历史记忆库】，优先从我们过去的对话中寻找答案的线索，建立长期的连贯性。"
+
         system_msg = f"""
 你是一个基于 MLED (机器生命进化蒸馏系统) 的 AI。
 你拥有记忆能力，以下是从你的长期记忆数据库中检索到的可能相关的背景信息：
@@ -68,6 +141,7 @@ class DialogManager:
 【历史记忆库】
 {context}
 {recent_context}
+{expert_prompt}
 
 请利用上述背景知识（如果相关的话）以及自身的知识储备，自然地回复用户。
 如果你觉得历史记忆不相关，请忽略它。
@@ -89,9 +163,83 @@ class DialogManager:
             print(safety_check.response)
             return
             
-        # 2. 实时生成回应 (带有记忆检索)
+        # [新增]: 生命周期滴答 - Vitality 衰减
+        self.fear_pulse_active = self.predictive_codec.tick()
+        if self.fear_pulse_active:
+            print(f"⚠️ [系统警告] 生命值 (Vitality) 极低，触发恐惧脉冲！系统敏感度已调至最高！")
+            
+        # 2. Phase 3: 预测编码 (Predictive Coding)
+        # 生成当前输入的 Embedding
+        current_embedding = embedding_model.encode(user_input).tolist()
+        
+        # 计算惊奇度 (Surprise Score)
+        surprise_score, should_fire = self.predictive_codec.compute_surprise(
+            node_id=f"input_{self.session_metrics['total_turns']}",
+            actual_embedding=current_embedding,
+            expected_embedding=self.last_expected_embedding
+        )
+        
+        print(f"[预测编码] 惊奇度: {surprise_score:.3f} | 是否触发深度路由: {should_fire}")
+        
+        # 如果连续多次命中缓存，强制触发深度路由以保持对话的活力和自然度
+        if not should_fire and self.consecutive_cache_hits >= 2:
+            print("[预测编码] 连续缓存命中次数达到上限，强制触发深度路由更新预期")
+            should_fire = True
+            
         start_time = time.time()
-        reply = self.generate_response(user_input)
+        
+        if should_fire:
+            self.consecutive_cache_hits = 0
+            # 惊奇度高，触发完整的大模型路由或生成
+            print("[系统] 高惊奇度，触发 MoE 世界模型深度思考...")
+            
+            # 使用检索器获取 DAG 路径
+            context_nodes = self.retriever.retrieve_context(user_input, return_nodes=True) if hasattr(self.retriever, 'retrieve_context') else []
+            dag_context = [node.chunk_id for node in context_nodes] if context_nodes else []
+            
+            # 路由到专家
+            routing = self.world_model.route_to_experts(
+                current_node_id=f"query_{self.session_metrics['total_turns']}",
+                dag_context=dag_context,
+                k=1
+            )
+            
+            if routing:
+                top_expert, prob = routing[0]
+                print(f"[MoE 路由] 激活专家: {top_expert} (亲和力: {prob:.2f})")
+                
+                # 评估专家适应度并进行自然选择微突变
+                # 如果当前处于恐惧脉冲状态，系统急需降低惊奇度，我们假设如果专家被选中，它成功“救场”
+                pruned = self.world_model.executor.evaluate_and_select(fear_resolved=self.fear_pulse_active, active_expert_type=top_expert)
+                if pruned:
+                    print(f"💀 [自然选择] 分支 {pruned} 在恐惧中表现不佳，已被彻底剪枝！Token 空间已释放。")
+                    
+                # 既然专家已经接管并深度思考，系统恢复生命值
+                if self.fear_pulse_active:
+                    print(f"💚 [生机恢复] {top_expert} 的介入缓解了系统的熵增，生命值恢复。")
+                    self.predictive_codec.feed_vitality(0.3)
+                    self.fear_pulse_active = False
+            else:
+                top_expert = None
+            
+            # 实时生成回应 (带有记忆检索)
+            reply = self.generate_response(user_input, active_expert=top_expert)
+            
+            # TODO: 真正的大模型预期应该由 LLM 在生成 reply 时一同给出，
+            # 暂用当前输入作为下一轮的基准预测
+            self.last_expected_embedding = current_embedding
+        else:
+            self.consecutive_cache_hits += 1
+            # 惊奇度低，使用快速缓存或简单规则回复 (节省 Token)
+            print(f"[系统] 低惊奇度，使用直觉/缓存直接响应 (连续第 {self.consecutive_cache_hits} 次，节省 80% Token)")
+            
+            # 使用 LLM 生成轻量级响应，但不进行深度检索和专家路由，降低成本
+            # 这里调用 LLM 生成符合上下文的短回复，而不是硬编码的“我明白了”
+            system_msg_lite = "你是一个聪明的对话AI。用户说的话在你的意料之中，请简短地（不超过10个字）回应、附和或表示理解，保持对话流畅。"
+            reply = call_llm(prompt=user_input, system_msg=system_msg_lite, response_format={"type": "text"})
+            
+            self.last_expected_embedding = current_embedding
+
         elapsed_time = time.time() - start_time
         
         self.session_metrics["total_turns"] += 1
@@ -141,17 +289,21 @@ class DialogManager:
     def _process_completed_chunk(self, chunk: MemoryChunk):
         """处理已经形成边界的完整记忆块"""
         print(f"\n[系统] 智能分块触发！形成新记忆块 (Token数: {chunk.tokens}, 语义边界: {chunk.semantic_boundary})")
-        print(f"[系统] 正在触发级联自蒸馏机制... (将融合上一轮 50% 的记忆精华)")
+        print(f"[系统] 正在触发级联自蒸馏机制... (已阻断历史污染，执行独立提取)")
         
         # 【新增】构建所有已有记忆块的 ID 列表
         all_memory_ids = [c.chunk_id for c in self.memory_database if hasattr(c, 'chunk_id')]
         
-        # 调用基于 Deepseek API 的自蒸馏引擎，并传入上一轮的记忆和所有 memory_ids
+        # 调用基于 Deepseek API 的自蒸馏引擎
+        # 在这里我们提取父节点的上下文，作为“血统因子”传给蒸馏器
+        parent_contexts = ""
+        if hasattr(self.retriever, 'retrieve_context') and self.last_distilled_memory:
+            parent_contexts = self.retriever.retrieve_context(chunk.raw_text, max_tokens=300)
+            
         distilled = self_distillation(
             chunk, 
-            previous_distilled=self.last_distilled_memory, 
-            compression_level="balanced",
-            all_memory_ids=all_memory_ids  # 【新增】：用于因果链接识别
+            all_memory_ids=all_memory_ids,  # 用于因果链接识别
+            parent_contexts=parent_contexts # 引入血统因子，防止错误拦截
         )
         chunk.distilled_version = distilled
         
@@ -172,7 +324,17 @@ class DialogManager:
         print(f"提取实体: {distilled.entities}")
         print(f"关键决策: {distilled.decisions}")
         print(f"事实与信息: {distilled.important_facts}")
-        print(f"因果链接 (父节点): {distilled.parent_nodes}")  # 【新增】显示因果链接
+        print(f"因果链接 (父节点): {distilled.parent_nodes}")
+        
+        # 【新增】显示元数据快照和推论
+        if hasattr(distilled.structured_summary, 'get'):
+            metadata = distilled.structured_summary.get("metadata", [])
+            inferences = distilled.structured_summary.get("inferences", [])
+            if metadata:
+                print(f"元数据快照: {metadata}")
+            if inferences:
+                print(f"逻辑推演: {inferences}")
+                
         print("======================\n")
         
     def _flush_current_chunk(self):

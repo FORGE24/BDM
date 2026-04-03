@@ -12,3 +12,4 @@ pyo3 = { version = "0.20.0", features = ["extension-module", "chrono"] }
 tiktoken-rs = "0.9.1"
 uuid = { version = "1.11.0", features = ["v4"] }
 chrono = "0.4.38"
+rand = "0.8"
