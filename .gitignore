@@ -55,3 +55,19 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+coverage/
+*.g.dart
+*.pb.dart
+*.freezed.dart
+lib/generated_plugin_registrant.dart
+bdm_gui/build/
+bdm_gui/.dart_tool/
+bdm_gui/.pub-cache/
+bdm_gui/.packages
