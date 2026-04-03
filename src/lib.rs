@@ -19,12 +19,13 @@ pub struct DistilledMemory {
     pub compression_ratio: f64,
     pub fidelity_score: f64,
     pub generation_cost: usize,
+    pub embedding: Vec<f64>,
 }
 
 #[pymethods]
 impl DistilledMemory {
     #[new]
-    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0))]
+    #[pyo3(signature = (source_chunk_id, structured_summary, entities=None, decisions=None, actions=None, constraints=None, preferences=None, code_snippets=None, important_facts=None, compression_ratio=0.0, fidelity_score=1.0, generation_cost=0, embedding=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         source_chunk_id: String,
@@ -39,6 +40,7 @@ impl DistilledMemory {
         compression_ratio: f64,
         fidelity_score: f64,
         generation_cost: usize,
+        embedding: Option<Vec<f64>>,
     ) -> Self {
         DistilledMemory {
             memory_id: Uuid::new_v4().to_string(),
@@ -54,6 +56,7 @@ impl DistilledMemory {
             compression_ratio,
             fidelity_score,
             generation_cost,
+            embedding: embedding.unwrap_or_default(),
         }
     }
 }

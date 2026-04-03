@@ -1,4 +1,4 @@
-#此项目由AI生成
+
 # MLED (Machine Life Evolutionary Distilling)
 
 MLED 是一套融合了**认知科学**与**进化算法**的 AI 机器生命进化蒸馏系统。它不仅是一个聊天机器人，更是一个具备“类生命特征”的认知引擎。系统通过 **Rust (PyO3)** 实现高性能的底层记忆与分块计算，并结合 **Python** 驱动顶层业务逻辑与大模型 (Deepseek) 的蒸馏过程。

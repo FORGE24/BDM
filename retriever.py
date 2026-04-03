@@ -1,19 +1,38 @@
+import numpy as np
 from database import DatabaseManager
 from memory import DistilledMemory
+from sentence_transformers import SentenceTransformer
 
 class MemoryRetriever:
-    """简单的基于关键字的混合检索器 (MVP 版本)"""
+    """混合检索器：关键字匹配 + 向量相似度 (MVP 版本)"""
     
-    def __init__(self, db_manager: DatabaseManager):
+    def __init__(self, db_manager: DatabaseManager, vector_weight: float = 0.7, keyword_weight: float = 0.3):
         self.db_manager = db_manager
+        self.vector_weight = vector_weight
+        self.keyword_weight = keyword_weight
+        # 初始化与 distiller 中相同的嵌入模型
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+    def _cosine_similarity(self, v1, v2):
+        """计算余弦相似度"""
+        if not v1 or not v2:
+            return 0.0
+        vec1 = np.array(v1)
+        vec2 = np.array(v2)
+        if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
+            return 0.0
+        return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
         
     def retrieve_context(self, query: str, limit: int = 3) -> str:
         """
         检索相关的记忆块，组装为上下文字符串。
-        MVP版通过简单的子串匹配来实现。
+        结合了简单的子串匹配与向量相似度计算。
         """
         session = self.db_manager.get_session()
         try:
+            # 1. 生成查询的向量
+            query_embedding = self.embedding_model.encode(query).tolist()
+            
             # 获取所有存储的蒸馏记忆
             from database import DBDistilledMemory
             all_memories = session.query(DBDistilledMemory).all()
@@ -21,9 +40,9 @@ class MemoryRetriever:
             scored_memories = []
             
             for memory in all_memories:
-                score = 0
+                keyword_score = 0
                 
-                # 在各种结构化字段中匹配
+                # 关键字匹配得分
                 fields_to_search = [
                     memory.entities,
                     memory.decisions,
@@ -34,12 +53,22 @@ class MemoryRetriever:
                 for field in fields_to_search:
                     if field:
                         for item in field:
-                            # 如果用户问题中的词在记忆项中，或者反之，加分
                             if item in query or any(q in item for q in query.split() if len(q)>1):
-                                score += 1
-                                
-                if score > 0:
-                    scored_memories.append((score, memory))
+                                keyword_score += 1
+                
+                # 向量相似度得分
+                vector_score = 0.0
+                if memory.embedding and len(memory.embedding) > 0:
+                    vector_score = self._cosine_similarity(query_embedding, memory.embedding)
+                    
+                # 归一化关键词得分 (假设最高分为10，简单处理)
+                normalized_keyword = min(1.0, keyword_score / 5.0)
+                
+                # 综合打分
+                final_score = (self.vector_weight * vector_score) + (self.keyword_weight * normalized_keyword)
+                
+                if final_score > 0.1: # 设定一个最低阈值
+                    scored_memories.append((final_score, memory))
                     
             # 排序并取前 N 个
             scored_memories.sort(key=lambda x: x[0], reverse=True)

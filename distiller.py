@@ -3,8 +3,12 @@ import json
 from dotenv import load_dotenv
 from openai import OpenAI
 from memory import MemoryChunk, DistilledMemory
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
+
+# 初始化本地的句子嵌入模型
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # 使用 OpenAI 兼容的客户端调用 Deepseek API
 api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -114,15 +118,24 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
         structured_summary = json.loads(summary_str)
         
         # 增加自我校验环节 (Self-Validation)
+        fidelity_score = 1.0
         is_valid, reason = self_validate_summary(structured_summary, chunk.raw_text)
         if not is_valid:
             print(f"[蒸馏自校验失败] 原因: {reason}")
             if max_retries > 0:
                 new_level = lower_compression(compression_level)
                 print(f"[蒸馏自校验] 尝试降低压缩率({new_level})并重试...")
-                return self_distillation(chunk, previous_distilled, new_level, max_retries - 1)
+                # 惩罚一次重试带来的保真度降低
+                retried_distilled = self_distillation(chunk, previous_distilled, new_level, max_retries - 1)
+                retried_distilled.fidelity_score = 0.8
+                return retried_distilled
             else:
                 print("[蒸馏自校验] 重试次数耗尽，强行保存当前不完美结果。")
+                fidelity_score = 0.5
+        
+        # 生成向量嵌入 (Vector Embedding)
+        embedding_text = f"实体: {' '.join(structured_summary.get('entities', []))} | 决策: {' '.join(structured_summary.get('decisions', []))} | 事实: {' '.join(structured_summary.get('important_facts', []))}"
+        embedding_vector = embedding_model.encode(embedding_text).tolist()
         
         # 构建 DistilledMemory
         distilled = DistilledMemory(
@@ -135,7 +148,9 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
             code_snippets=structured_summary.get("code_snippets", []),
             important_facts=structured_summary.get("important_facts", []),
             constraints=structured_summary.get("constraints", []),
-            compression_ratio=len(summary_str) / max(1, chunk.tokens)
+            compression_ratio=len(summary_str) / max(1, chunk.tokens),
+            fidelity_score=fidelity_score,
+            embedding=embedding_vector
         )
         return distilled
     except Exception as e:
@@ -143,5 +158,6 @@ def self_distillation(chunk: MemoryChunk, previous_distilled: DistilledMemory = 
         # 降级或返回空
         return DistilledMemory(
             source_chunk_id=chunk.chunk_id,
-            structured_summary={"error": str(e)}
+            structured_summary={"error": str(e)},
+            embedding=[]
         )

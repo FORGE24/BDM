@@ -54,13 +54,15 @@ class EvolutionaryOptimizer:
             "keyword_weight": 0.3
         }
         
-    def collect_performance_data(self, evaluation_period: int) -> SystemState:
-        """收集系统的运行表现数据（目前为模拟）"""
+    def collect_performance_data(self, metrics: Dict[str, float] = None) -> SystemState:
+        """收集系统的真实运行表现数据"""
         state = SystemState()
-        # 模拟：随着代数增加，各项指标有一定的随机波动和改善
-        state.task_success_rate = min(1.0, state.task_success_rate + random.uniform(-0.05, 0.1))
-        state.memory_fidelity_score = min(1.0, state.memory_fidelity_score + random.uniform(-0.02, 0.08))
-        state.average_response_time = max(0.1, state.average_response_time + random.uniform(-0.1, 0.1))
+        if metrics:
+            state.task_success_rate = metrics.get("task_success_rate", state.task_success_rate)
+            state.memory_fidelity_score = metrics.get("memory_fidelity_score", state.memory_fidelity_score)
+            state.average_response_time = metrics.get("average_response_time", state.average_response_time)
+            state.user_engagement_score = metrics.get("user_engagement_score", state.user_engagement_score)
+            state.cost_per_conversation = metrics.get("cost_per_conversation", state.cost_per_conversation)
         return state
         
     def needs_evolution(self, current_fitness: float) -> bool:
@@ -120,9 +122,9 @@ class EvolutionaryOptimizer:
         """应用新的系统参数"""
         self.current_params = new_params
         
-    def evolution_cycle(self, evaluation_period: int = 100) -> tuple[bool, Optional[Dict[str, float]]]:
+    def evolution_cycle(self, metrics: Dict[str, float] = None) -> tuple[bool, Optional[Dict[str, float]]]:
         """执行一次完整的进化周期"""
-        performance_data = self.collect_performance_data(evaluation_period)
+        performance_data = self.collect_performance_data(metrics)
         current_fitness = self.fitness_function.calculate_fitness(performance_data)
         self.fitness_history.append(current_fitness)
         

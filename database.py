@@ -1,6 +1,7 @@
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Boolean, Text, JSON, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
+from bdm_rust import MemoryChunk, DistilledMemory
 
 Base = declarative_base()
 
@@ -43,6 +44,7 @@ class DBDistilledMemory(Base):
     preferences = Column(JSON, default=list)
     code_snippets = Column(JSON, default=list)
     important_facts = Column(JSON, default=list)
+    embedding = Column(JSON, default=list)
     
     # 元数据
     compression_ratio = Column(Float, default=0.0)
@@ -96,6 +98,7 @@ class DatabaseManager:
                     preferences=dist.preferences,
                     code_snippets=dist.code_snippets,
                     important_facts=dist.important_facts,
+                    embedding=dist.embedding,
                     compression_ratio=dist.compression_ratio,
                     fidelity_score=dist.fidelity_score,
                     generation_cost=dist.generation_cost
@@ -108,5 +111,58 @@ class DatabaseManager:
             print(f"数据库保存失败: {e}")
             session.rollback()
             return False
+        finally:
+            session.close()
+            
+    def load_memory_chunks(self):
+        """从数据库加载所有记忆块"""
+        session = self.get_session()
+        try:
+            db_chunks = session.query(DBMemoryChunk).all()
+            memory_chunks = []
+            for db_chunk in db_chunks:
+                # 创建MemoryChunk实例
+                chunk = MemoryChunk(db_chunk.raw_text, db_chunk.tokens, db_chunk.semantic_boundary)
+                
+                # 设置其他属性
+                chunk.chunk_id = db_chunk.chunk_id
+                chunk.timestamp = db_chunk.timestamp
+                chunk.status = db_chunk.status
+                chunk.access_count = db_chunk.access_count
+                chunk.last_accessed = db_chunk.last_accessed
+                chunk.forgetting_rate = db_chunk.forgetting_rate
+                chunk.recovery_potential = db_chunk.recovery_potential
+                chunk.importance_score = db_chunk.importance_score
+                chunk.related_chunks = db_chunk.related_chunks or []
+                
+                # 如果有蒸馏版本
+                if db_chunk.distilled_memory:
+                    db_dist = db_chunk.distilled_memory
+                    dist = DistilledMemory(
+                        source_chunk_id=db_dist.source_chunk_id,
+                        structured_summary=db_dist.structured_summary,
+                        entities=db_dist.entities,
+                        decisions=db_dist.decisions,
+                        actions=db_dist.actions,
+                        constraints=db_dist.constraints,
+                        preferences=db_dist.preferences,
+                        code_snippets=db_dist.code_snippets,
+                        important_facts=db_dist.important_facts,
+                        compression_ratio=db_dist.compression_ratio,
+                        fidelity_score=db_dist.fidelity_score,
+                        generation_cost=db_dist.generation_cost,
+                        embedding=db_dist.embedding
+                    )
+                    dist.memory_id = db_dist.memory_id
+                    chunk.distilled_version = dist
+                else:
+                    chunk.distilled_version = None
+                
+                memory_chunks.append(chunk)
+            
+            return memory_chunks
+        except Exception as e:
+            print(f"数据库加载失败: {e}")
+            return []
         finally:
             session.close()

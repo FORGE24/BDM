@@ -1,4 +1,5 @@
 import os
+import time
 from dotenv import load_dotenv
 import bdm_rust
 from memory import MemoryChunk
@@ -29,11 +30,20 @@ class DialogManager:
             recovery_threshold=params["recovery_threshold"]
         )
         
-        self.current_stream = [] # 记录当前未分块的对话流
-        self.memory_database = []
-        self.last_distilled_memory = None  # 记录上一轮的蒸馏记忆
         self.db_manager = DatabaseManager()
+        self.current_stream = [] # 记录当前未分块的对话流
+        self.memory_database = self.db_manager.load_memory_chunks()  # 从数据库加载记忆
+        self.last_distilled_memory = None  # 记录上一轮的蒸馏记忆
         self.retriever = MemoryRetriever(self.db_manager)
+        
+        # 用于反馈进化引擎的真实指标收集
+        self.session_metrics = {
+            "tasks_completed": 0,
+            "total_turns": 0,
+            "total_response_time": 0.0,
+            "total_tokens_used": 0,
+            "fidelity_scores": []
+        }
         
     def generate_response(self, user_input: str) -> str:
         """生成大模型响应，结合相关历史记忆"""
@@ -80,11 +90,20 @@ class DialogManager:
             return
             
         # 2. 实时生成回应 (带有记忆检索)
+        start_time = time.time()
         reply = self.generate_response(user_input)
+        elapsed_time = time.time() - start_time
+        
+        self.session_metrics["total_turns"] += 1
+        self.session_metrics["total_response_time"] += elapsed_time
+        self.session_metrics["total_tokens_used"] += bdm_rust.count_tokens(user_input + reply)
+        
         print(f"🤖 MLED: {reply}")
         
         # 3. 意图识别检查：如果用户发言代表了话题的自然结束，则主动截断流
         task_complete = check_task_completion(user_input)
+        if task_complete:
+            self.session_metrics["tasks_completed"] += 1
         
         # 将用户的输入和系统回复一并加入当前流
         combined_interaction = f"用户: {user_input}\n系统: {reply}"
@@ -131,6 +150,7 @@ class DialogManager:
         self.memory_database.append(chunk)
         # 更新记录，以便下一个块使用
         self.last_distilled_memory = distilled
+        self.session_metrics["fidelity_scores"].append(distilled.fidelity_score)
         
         # 将记忆存入 SQLite 数据库
         if self.db_manager.save_memory_chunk(chunk):
@@ -173,7 +193,26 @@ class DialogManager:
     def run_evolution_cycle(self):
         """执行一次自我进化周期，更新系统的配置参数"""
         print("\n[系统后台] 开始执行自进化周期 (Self-Evolution)...")
-        evolved, new_params = self.evolution_engine.evolution_cycle()
+        
+        # 计算真实收集的指标
+        metrics = {}
+        if self.session_metrics["total_turns"] > 0:
+            metrics["task_success_rate"] = 1.0 if self.session_metrics["tasks_completed"] > 0 else 0.5
+            metrics["average_response_time"] = self.session_metrics["total_response_time"] / self.session_metrics["total_turns"]
+            metrics["user_engagement_score"] = min(1.0, self.session_metrics["total_turns"] / 10.0) # 假设10轮对话为高参与度
+            metrics["cost_per_conversation"] = self.session_metrics["total_tokens_used"] / 10000.0 # 假设10k tokens成本为1
+            
+        if self.session_metrics["fidelity_scores"]:
+            metrics["memory_fidelity_score"] = sum(self.session_metrics["fidelity_scores"]) / len(self.session_metrics["fidelity_scores"])
+            
+        evolved, new_params = self.evolution_engine.evolution_cycle(metrics)
+        
+        # 重置部分短期指标（视系统设计而定，这里可以选择重置或保留）
+        self.session_metrics["total_turns"] = 0
+        self.session_metrics["total_response_time"] = 0.0
+        self.session_metrics["total_tokens_used"] = 0
+        self.session_metrics["tasks_completed"] = 0
+        self.session_metrics["fidelity_scores"] = []
         
         if evolved and new_params:
             print(f"  [进化引擎] 繁衍成功！应用第 {self.evolution_engine.generation} 代新参数:")
